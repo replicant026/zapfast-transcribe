@@ -299,6 +299,7 @@ impl Worker {
             id,
             message,
             expiration,
+            None,
         ));
     }
 }

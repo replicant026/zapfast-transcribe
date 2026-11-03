@@ -11,6 +11,12 @@ pub enum Stop {
     Send,
     Attach,
     Emoji,
+    /// Staged-file review: the file strip and its controls.
+    ReviewFile(usize),
+    ReviewRemove(usize),
+    ReviewAdd,
+    ReviewEdit,
+    ReviewClose,
     PhoneLink(u32),
     /// The chat header's Search, then the search pane's controls in reading
     /// order. The arrows walk its results from the field.
@@ -120,6 +126,33 @@ pub(crate) fn control(ctx: &Context, stop: Stop) -> Option<Id> {
         .controls
         .into_iter()
         .find_map(|(known, id)| (known == stop).then_some(id))
+}
+
+/// Remembers an icon button by its tooltip, so a scripted demo can find a
+/// button that paints no text where it was last drawn.
+#[cfg(any(test, feature = "demo"))]
+pub(crate) fn name_button(ctx: &Context, tooltip: &str, id: Id) {
+    if tooltip.is_empty() {
+        return;
+    }
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<std::collections::HashMap<String, Id>>(buttons_id())
+            .insert(tooltip.to_owned(), id);
+    });
+}
+
+/// The icon button last drawn with `tooltip`, if any.
+#[cfg(any(test, feature = "demo"))]
+pub(crate) fn named_button(ctx: &Context, tooltip: &str) -> Option<Id> {
+    ctx.data(|data| {
+        data.get_temp::<std::collections::HashMap<String, Id>>(buttons_id())
+            .and_then(|buttons| buttons.get(tooltip).copied())
+    })
+}
+
+#[cfg(any(test, feature = "demo"))]
+fn buttons_id() -> Id {
+    Id::new("demo-icon-buttons")
 }
 
 /// Intercept Tab before any widgets are registered. Merely consuming the key

@@ -28,6 +28,9 @@ engine. In our Linux test it opens in under a second and uses about 200 MB of
 idle RAM, against 1.13 GB for WhatsApp Web.
 [See the measurements](https://zapfast.rocks/benchmarks/).
 
+This repository is a fork of [alexandrereyes/zapfast](https://github.com/alexandrereyes/zapfast),
+which is itself a fork of the original [crmne/zapfast](https://github.com/crmne/zapfast).
+
 The interface is available in English, Chinese (Simplified and Traditional),
 French, German, Indonesian, Italian, Portuguese (Brazil), Russian, Spanish,
 and Turkish.

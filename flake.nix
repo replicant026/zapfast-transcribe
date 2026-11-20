@@ -146,6 +146,7 @@
               [
                 alsa-lib
                 pipewire
+                openssl
                 libGL
                 libx11
               ]

@@ -32,8 +32,8 @@ This repository is a fork of [alexandrereyes/zapfast](https://github.com/alexand
 which is itself a fork of the original [crmne/zapfast](https://github.com/crmne/zapfast).
 
 The interface is available in English, Chinese (Simplified and Traditional),
-French, German, Indonesian, Italian, Portuguese (Brazil), Russian, Spanish,
-and Turkish.
+Dutch, French, German, Indonesian, Italian, Portuguese (Brazil), Russian,
+Spanish, and Turkish.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">

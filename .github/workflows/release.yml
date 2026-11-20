@@ -57,14 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            container: debian:12
-          # A native arm64 runner, so the GUI's system libraries need no
-          # cross-compilation sysroot.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            container: debian:12
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           # Cross-compiled from x64: the MSVC arm64 linker ships with the
@@ -184,122 +176,9 @@ jobs:
             dist/*.msi
           if-no-files-found: error
 
-  macos:
-    name: macOS universal app
-    needs: release-source
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    runs-on: macos-latest
-    env:
-      # Complete Apple credentials enable native-packages signing/notarization.
-      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      # No compiler cache, as in the build job above.
-      - name: Build both architectures
-        run: |
-          cargo build --locked --release --target aarch64-apple-darwin
-          cargo build --locked --release --target x86_64-apple-darwin
-
-      - name: Universal binary
-        run: |
-          mkdir -p universal
-          lipo -create \
-            target/aarch64-apple-darwin/release/zapfast \
-            target/x86_64-apple-darwin/release/zapfast \
-            -output universal/zapfast
-          # The two release builds fill most of the runner's disk; the DMG
-          # and its notarization copy need room of their own.
-          rm -rf target
-          df -h "$RUNNER_TEMP"
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '4.0'
-      - name: Install native packaging
-        run: gem install native-packages --version 0.11.0 --no-document
-
-      - name: App bundle
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/macos-input
-          bash packaging/macos/bundle.sh universal/zapfast dist/macos-input/ZapFast.app "$version"
-          cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/macos-input/
-
-      - name: Package, sign and notarize macOS app
-        run: |
-          native-packages build \
-            --version "${GITHUB_REF_NAME#v}" --target macos-universal --defer-recipes \
-            --output "$RUNNER_TEMP/macos-packages"
-          cp "$RUNNER_TEMP/macos-packages/packages/macos-universal/dmg/"*.dmg dist/
-
-      - name: Verify the notarized release app
-        run: bash packaging/macos/verify.sh "dist/zapfast-${GITHUB_REF_NAME}-macos-universal.dmg"
-
-      - name: Attest macOS package
-        uses: crmne/native-packages/.github/actions/attest@25a4214d2f203357c84b069f39de7c17c0be6253 # v0.11.0
-        with:
-          subject-path: dist/*.dmg
-      - uses: actions/upload-artifact@v7
-        with:
-          name: macos-universal
-          path: dist/*.dmg
-          if-no-files-found: error
-
-  # The Linux build packaged as a Flatpak bundle: the same binary, in the
-  # sandbox packaging/flatpak describes, so nothing compiles twice. Flathub
-  # builds from source on its own machines, from the manifest beside it.
-  flatpak:
-    name: Flatpak bundle
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    needs: build
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
-      options: --privileged
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          name: x86_64-unknown-linux-gnu
-          path: dist
-      - name: Unpack the Linux build
-        run: |
-          tar xzf dist/zapfast-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz -C packaging/flatpak
-          mv packaging/flatpak/zapfast-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu packaging/flatpak/built
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          manifest-path: packaging/flatpak/rocks.zapfast.ZapFast.bundle.yml
-          bundle: zapfast-${{ github.ref_name }}-x86_64.flatpak
-          cache: false
-          upload-artifact: false
-      - name: Attest Flatpak bundle
-        uses: crmne/native-packages/.github/actions/attest@25a4214d2f203357c84b069f39de7c17c0be6253 # v0.11.0
-        with:
-          subject-path: "*.flatpak"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: flatpak
-          path: "*.flatpak"
-          if-no-files-found: error
-
   publish:
     name: GitHub release
-    needs: [build, macos, flatpak]
+    needs: [build]
     runs-on: ubuntu-latest
     environment: release-signing
     permissions:

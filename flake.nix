@@ -52,6 +52,7 @@
                   (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
                   rust-analyzer
                   pkg-config
+                  openssl
                   cmake
                   perl
                 ]

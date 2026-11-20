@@ -79,7 +79,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git build-essential pkg-config \
+            ca-certificates curl git build-essential pkg-config libssl-dev \
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev \
             libpipewire-0.3-dev clang libclang-dev cmake perl
       - uses: actions/checkout@v7

@@ -5,12 +5,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::model::{
-    Chat, ChatId, Contact, Gif, GifError, Message, PollDraft, StickerPack, StorageStats,
+    Chat, ChatActivity, ChatId, Contact, Gif, GifError, GifPage, Message, PollDraft, StickerPack,
+    StorageStats,
 };
 use crate::paths::AccountDirs;
 
@@ -76,6 +77,26 @@ impl LinkStatus {
 mod tests {
     use super::LinkStatus;
 
+    /// Quitting stops waiting for a runtime still busy at the deadline,
+    /// and waits for one that ends in time.
+    #[test]
+    fn quitting_waits_for_the_runtime_only_until_the_deadline() {
+        use std::time::{Duration, Instant};
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (mut busy, _) = super::Backend::detached();
+        busy.thread = Some(std::thread::spawn(move || {
+            let _ = held.recv();
+        }));
+        assert!(!busy.wait_for_shutdown(Instant::now() + Duration::from_millis(50)));
+        release.send(()).unwrap();
+
+        let (mut done, _) = super::Backend::detached();
+        done.thread = Some(std::thread::spawn(|| {}));
+        assert!(done.wait_for_shutdown(Instant::now() + Duration::from_secs(60)));
+        let (mut never_started, _) = super::Backend::detached();
+        assert!(never_started.wait_for_shutdown(Instant::now()));
+    }
+
     #[test]
     fn backend_waits_for_window_acknowledgement_before_touching_storage() {
         let directory = tempfile::tempdir().unwrap();
@@ -126,8 +147,37 @@ pub struct CreatedPoll {
     pub recipients: Vec<String>,
 }
 
+/// An attachment's place in its chat's line of sends.
+#[derive(Debug)]
+pub struct SendTurn {
+    /// Resolved once the attachment has gone out or failed, so the next one
+    /// may follow it.
+    pub done: tokio::sync::oneshot::Sender<()>,
+    /// The linked session it was staged in: after a sign-out it is dropped,
+    /// never archived or sent from the account linked next.
+    pub generation: u64,
+    /// Settles this attachment's send against the reader's cancel.
+    pub gate: crate::model::UploadGate,
+}
+
 #[derive(Debug)]
 pub enum Command {
+    FetchBlocklist,
+    SetBlocked {
+        chat: ChatId,
+        blocked: bool,
+    },
+    /// Internal replies from the library, bound to the requesting session.
+    BlocklistFetched {
+        generation: u64,
+        result: Result<Vec<ChatId>, ()>,
+    },
+    BlockedSet {
+        generation: u64,
+        chat: ChatId,
+        blocked: bool,
+        result: Result<(), ()>,
+    },
     RefreshPoll {
         chat: ChatId,
         message: String,
@@ -167,6 +217,13 @@ pub enum Command {
         text: String,
         quoting: Option<crate::model::ReplyTarget>,
         mentions: Vec<String>,
+        /// A preview built here for the first link in `text`.
+        preview: Option<crate::model::ComposedPreview>,
+    },
+    /// Reads the page behind a link in the composer; answered by
+    /// [`Event::LinkPreview`]. A newer request replaces an unfinished one.
+    FetchLinkPreview {
+        url: String,
     },
     SendLocation {
         chat: ChatId,
@@ -198,6 +255,26 @@ pub enum Command {
     Composing {
         chat: ChatId,
         composing: bool,
+    },
+    SetChatExportAllowed(bool),
+    ExportChat {
+        request: u64,
+        chat: ChatId,
+        include_media: bool,
+    },
+    CancelChatExport,
+    ChatExportTarget {
+        request: u64,
+        include_media: bool,
+        target: Option<PathBuf>,
+    },
+    ChatExportProgress {
+        request: u64,
+        counts: crate::archive::chat_export::Counts,
+    },
+    ChatExportFinished {
+        request: u64,
+        result: Result<Option<(PathBuf, crate::archive::chat_export::Counts)>, String>,
     },
     /// Stores the open chat's unsent text, so it survives a restart.
     SaveDraft {
@@ -276,6 +353,22 @@ pub enum Command {
     DownloadMotion {
         chat: ChatId,
         message: String,
+    },
+    /// Transcribes the voice messages on screen, in `ids` order.
+    /// Replaces whatever was queued for another chat; an id that leaves the
+    /// screen before its turn is dropped without being transcribed.
+    Transcribe {
+        chat: ChatId,
+        ids: Vec<String>,
+        model: crate::transcribe::Model,
+    },
+    CancelTranscription,
+    SetTranscriptionModel(crate::transcribe::Model),
+    PrepareTranscriptionModel(crate::transcribe::Model),
+    TranscribeAgain {
+        chat: ChatId,
+        message: String,
+        model: crate::transcribe::Model,
     },
     /// Requests a profile picture; `full` selects the info-dialog size.
     FetchAvatar {
@@ -396,6 +489,8 @@ pub enum Command {
         /// Sends every file as a document with its original bytes, instead
         /// of turning pictures, videos and audio into media messages.
         documents: bool,
+        /// Sends the one supported photo as a WhatsApp view-once message.
+        view_once: bool,
         caption: Option<String>,
         mentions: Vec<String>,
         /// The message the first file replies to.
@@ -407,6 +502,8 @@ pub enum Command {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+        /// Sends this pasted picture as a WhatsApp view-once message.
+        view_once: bool,
         caption: Option<String>,
         mentions: Vec<String>,
         quoting: Option<crate::model::ReplyTarget>,
@@ -512,6 +609,11 @@ pub enum Command {
     FirstNamesRecovered {
         complete: bool,
     },
+    /// Internal: the one-time replay of the phone's stars, for those made
+    /// before ZapFast followed them, finished.
+    StarsRecovered {
+        complete: bool,
+    },
     /// Internal: a favorite from the phone finished downloading.
     FavoriteFetched {
         hash: String,
@@ -547,6 +649,21 @@ pub enum Command {
         chat: ChatId,
         speed: Option<f32>,
     },
+    /// Changes a chat's disappearing-message timer; `0` turns it off.
+    SetDisappearingTimer {
+        chat: ChatId,
+        seconds: u32,
+    },
+    /// Internal: a disappearing-timer change went out. `Ok` carries the sent
+    /// message's id and setting time, whose server ack decides whether the
+    /// timer is written. `session` identifies the account this completion
+    /// belongs to.
+    TimerSet {
+        chat: ChatId,
+        session: u64,
+        seconds: u32,
+        result: Result<(String, i64), String>,
+    },
     /// Asks for a folder for new downloads.
     PickDownloadFolder,
     /// Asks for a wallpaper image and copies it into the state directory.
@@ -566,6 +683,11 @@ pub enum Command {
     SetGroupName {
         chat: ChatId,
         name: String,
+    },
+    /// Changes a group's description on WhatsApp; empty removes it.
+    SetGroupDescription {
+        chat: ChatId,
+        description: String,
     },
     /// Asks for a picture and makes it the group's photo.
     PickGroupPicture(ChatId),
@@ -592,10 +714,43 @@ pub enum Command {
         result: Result<CreatedGroup, crate::new_group::CreateFailure>,
         picture: Option<std::path::PathBuf>,
     },
-    /// Internal: WhatsApp answered a change to a group's name or photo.
+    /// Asks for a group's invite link, answered by `Event::GroupInviteLink`;
+    /// `reset` revokes the old link first, for admins.
+    GroupInviteLink {
+        chat: ChatId,
+        reset: bool,
+    },
+    /// Adds people to a group, answered by `Event::GroupMembersAdded`.
+    /// `members` are canonical chat ids.
+    AddGroupMembers {
+        chat: ChatId,
+        members: Vec<ChatId>,
+    },
+    /// Changes one of a group's permissions, for its admins: `members`
+    /// true lets every member (for approval, turns it on).
+    SetGroupPermission {
+        chat: ChatId,
+        permission: crate::group_admin::Permission,
+        members: bool,
+    },
+    /// Makes a member an admin, dismisses one, or removes them.
+    ChangeGroupMember {
+        chat: ChatId,
+        member: ChatId,
+        change: crate::group_admin::MemberChange,
+    },
+    /// Internal: WhatsApp answered one of the group management commands.
+    GroupManaged {
+        chat: ChatId,
+        answer: GroupAnswer,
+    },
+    /// Internal: WhatsApp answered a change to a group's name, photo or
+    /// timer. `session` is the account session the change was sent under; a
+    /// completion from a departed session is discarded.
     GroupEdited {
         chat: ChatId,
         edit: GroupEdit,
+        session: u64,
         result: Result<(), String>,
     },
     /// Internal: the server accepted a profile change.
@@ -616,6 +771,14 @@ pub enum Command {
     SaveAttachmentAs {
         source: std::path::PathBuf,
         name: String,
+    },
+    /// The reader tried to open this message's attachment and its file is
+    /// gone: finds it again or lets it download again.
+    AttachmentMissing {
+        chat: ChatId,
+        message: String,
+        card: Option<usize>,
+        path: PathBuf,
     },
     /// Opens the log, or shows it in its folder, off the interface thread;
     /// only a failure reports back.
@@ -675,6 +838,18 @@ pub enum Command {
         result: Result<PathBuf, String>,
         chat: Option<ChatId>,
         quoting: Option<crate::model::ReplyTarget>,
+    },
+    /// Builds a bounded pasted-picture preview away from the UI thread.
+    PreparePicturePreview {
+        target: crate::app::AttachmentId,
+        width: usize,
+        height: usize,
+        rgba: Arc<Vec<u8>>,
+    },
+    /// Internal: the bounded preview produced by a blocking worker.
+    PicturePreviewReady {
+        target: crate::app::AttachmentId,
+        image: Option<egui::ColorImage>,
     },
     /// Reads a staged picture's size, so the cropper can open on it.
     InspectPicture {
@@ -744,7 +919,9 @@ pub enum Command {
         full_name: Option<String>,
         first_name: Option<String>,
         to_phone: bool,
-        registered: Result<bool, String>,
+        /// The number WhatsApp has the account under, which can differ from `phone`; `None`
+        /// when the number is not on WhatsApp.
+        registered: Result<Option<String>, String>,
     },
     /// Downloads and sends a GIF as a short looping video.
     SendGif {
@@ -756,6 +933,14 @@ pub enum Command {
     SearchGifs {
         query: String,
         key: String,
+        offset: usize,
+        request: u64,
+    },
+    /// Downloads one GIF result's animated preview when its tile shows.
+    FetchGifAnimation {
+        id: String,
+        url: String,
+        extension: String,
     },
     /// Loads recent and saved stickers for the picker.
     RecentStickers,
@@ -765,6 +950,13 @@ pub enum Command {
         emoji: String,
     },
     SetArchived(ChatId, bool),
+    Archived {
+        chat: ChatId,
+        archived: bool,
+        at: i64,
+        request: u64,
+        result: Result<(), ()>,
+    },
     /// Leaves a group or channel. `archive` also hides the chat in Archived.
     LeaveGroup {
         chat: ChatId,
@@ -824,6 +1016,10 @@ pub enum Command {
     /// Unlinks this account and deletes its local folders.
     RemoveAccount,
     Reconnect,
+    /// Starts a fresh WhatsApp client over the same device store, for a link
+    /// the library ended for good (a spent QR-only pairing) and that a
+    /// reconnect therefore cannot revive.
+    Relink,
     /// Use this proxy setting and reconnect. Empty follows the environment.
     SetProxy(String),
     /// Sets aside an unreadable archive and the linked session, then starts
@@ -875,7 +1071,14 @@ pub enum Command {
     /// Internal GIPHY result.
     GifResults {
         query: String,
-        results: Result<Vec<Gif>, GifError>,
+        offset: usize,
+        request: u64,
+        results: Result<GifPage, GifError>,
+    },
+    /// Internal GIF animated-preview result.
+    GifAnimated {
+        id: String,
+        path: Option<PathBuf>,
     },
     /// Measures this account's media cache for Settings, answered by
     /// `Event::StorageStats` with the same `token`.
@@ -906,7 +1109,12 @@ pub enum Command {
         chat: ChatId,
         row: Box<Message>,
         raw: Vec<u8>,
+        /// Its place in the chat's line, for an attachment that waits for the
+        /// one staged before it.
+        turn: Option<SendTurn>,
     },
+    /// Phone numbers a group's metadata named, as (privacy id, number).
+    LearnNumbers(Vec<(String, String)>),
     /// Internal send audience. The sender waits for it to be archived.
     GroupRecipients {
         chat: ChatId,
@@ -938,6 +1146,12 @@ pub enum Command {
         /// The chat's rename generation when this metadata was asked for. A
         /// snapshot older than a rename made here cannot restore the old name.
         subject_generation: u64,
+        /// The group's permissions and admins.
+        settings: crate::model::GroupSettings,
+        /// The chat's management generation when this metadata was asked
+        /// for. A snapshot older than a permission or member change made here
+        /// cannot undo it.
+        settings_generation: u64,
     },
     /// Internal pairing-code result.
     PairCode {
@@ -1002,6 +1216,24 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
+    Blocklist {
+        state: crate::blocking::Blocklist,
+        error: Option<crate::blocking::Failure>,
+    },
+    /// Apply a privacy-id mapping together with its chat locks and blocklist.
+    BlocklistMapped {
+        from: ChatId,
+        to: ChatId,
+        chats: Vec<Chat>,
+        state: crate::blocking::Blocklist,
+    },
+    /// The phone's "Disable link previews", sent at start and on every change.
+    LinkPreviewsDisabled(bool),
+    /// What the page at `url` says about itself, or `None` when it said nothing.
+    LinkPreview {
+        url: String,
+        preview: Option<crate::model::ComposedPreview>,
+    },
     InteractiveReplyState {
         chat: ChatId,
         message: String,
@@ -1053,6 +1285,23 @@ pub enum Event {
     },
     /// The starred messages, newest star first.
     StarredList(Vec<crate::archive::Starred>),
+    /// A voice message started transcribing here.
+    TranscriptionStarted {
+        chat: ChatId,
+        message: String,
+    },
+    /// A voice message left the transcription queue: what it says, or `None`
+    /// when it could not be transcribed.
+    Transcription {
+        chat: ChatId,
+        message: String,
+        text: Option<String>,
+    },
+    /// Public model state only, never a recording or transcript.
+    TranscriptionModel {
+        model: crate::transcribe::Model,
+        state: crate::transcribe::State,
+    },
     /// Messages in one chat matching a search, newest first, echoing the
     /// query and range asked for so a stale answer can be told apart.
     ChatHits {
@@ -1102,7 +1351,23 @@ pub enum Event {
         older: bool,
         complete: bool,
     },
+    /// History toward a message (`Command::LoadUntil`) that could not be
+    /// read, and why. It ends the chat's wait for older history as an empty
+    /// older page does, and is one event so that the replied-message jump
+    /// waiting on it says this error alone, never "not found" before it.
+    HistoryUnavailable {
+        chat: ChatId,
+        error: String,
+    },
     MessageUpdated(Box<Message>),
+    ChatExportProgress {
+        request: u64,
+        counts: crate::archive::chat_export::Counts,
+    },
+    ChatExportFinished {
+        request: u64,
+        result: Result<Option<(PathBuf, crate::archive::chat_export::Counts)>, String>,
+    },
     /// The account's media cache as measured, `None` when it could not be
     /// read. `cleared` says the cache was just emptied, so files the
     /// interface still points into it are gone.
@@ -1131,7 +1396,7 @@ pub enum Event {
     Typing {
         chat: ChatId,
         sender: String,
-        composing: bool,
+        activity: Option<ChatActivity>,
     },
     Presence {
         id: String,
@@ -1159,7 +1424,14 @@ pub enum Event {
     /// GIF search results or failure.
     Gifs {
         query: String,
-        results: Result<Vec<Gif>, GifError>,
+        offset: usize,
+        request: u64,
+        results: Result<GifPage, GifError>,
+    },
+    /// A GIF result's animated preview finished downloading.
+    GifAnimated {
+        id: String,
+        path: Option<PathBuf>,
     },
     /// A picture chosen for the sticker maker: its file, size, and whether it
     /// has see-through pixels.
@@ -1168,6 +1440,11 @@ pub enum Event {
         width: u32,
         height: u32,
         transparent: bool,
+    },
+    /// Bounded preview pixels; only the UI uploads the texture.
+    PicturePreviewReady {
+        target: crate::app::AttachmentId,
+        image: Option<egui::ColorImage>,
     },
     /// A staged picture's size, so the cropper can open on it.
     PictureInspected {
@@ -1197,6 +1474,27 @@ pub enum Event {
         chat: ChatId,
         message: String,
         result: Result<PathBuf, String>,
+    },
+    /// How far an attachment download has got, for its ring.
+    DownloadProgress {
+        chat: ChatId,
+        message: String,
+        percent: u8,
+    },
+    /// How far a file being sent has gone out, for the strip above the
+    /// composer, and roughly how many seconds the rest takes. The first one,
+    /// at 0, comes before it is prepared.
+    UploadProgress {
+        id: u64,
+        gate: crate::model::UploadGate,
+        chat: ChatId,
+        name: String,
+        percent: u8,
+        seconds_left: Option<u32>,
+    },
+    /// The upload with this id is over, sent or not.
+    UploadEnded {
+        id: u64,
     },
     /// A motion photo's clip finished downloading, or failed.
     Motion {
@@ -1265,6 +1563,31 @@ pub enum Event {
     },
     /// A picture picked for a group being created, staged as a JPEG.
     NewGroupPicture(Result<std::path::PathBuf, String>),
+    /// A group's invite link, or why it could not be had.
+    GroupInviteLink {
+        chat: ChatId,
+        reset: bool,
+        result: Result<crate::group_admin::InviteLink, crate::group_admin::Failure>,
+    },
+    /// `Command::AddGroupMembers` finished.
+    GroupMembersAdded {
+        chat: ChatId,
+        result: Result<crate::group_admin::Added, crate::group_admin::Failure>,
+    },
+    /// `Command::SetGroupPermission` finished; on success the chat is
+    /// already updated.
+    GroupPermissionSaved {
+        chat: ChatId,
+        permission: crate::group_admin::Permission,
+        result: Result<(), crate::group_admin::Failure>,
+    },
+    /// `Command::ChangeGroupMember` finished.
+    GroupMemberChanged {
+        chat: ChatId,
+        member: ChatId,
+        change: crate::group_admin::MemberChange,
+        result: Result<(), crate::group_admin::Failure>,
+    },
     /// `Command::CreateGroup` finished: the group is filed and can open.
     GroupCreated {
         request: u64,
@@ -1325,10 +1648,21 @@ pub enum Event {
     },
     /// The account folders were deleted after RemoveAccount.
     AccountRemoved,
+    ArchiveFailed {
+        archived: bool,
+        failure: ArchiveFailure,
+    },
     Error(String),
     /// A change to a group's name or photo went to WhatsApp (`saving`), or
     /// WhatsApp answered it.
     GroupSaving {
+        chat: ChatId,
+        saving: bool,
+    },
+    /// A disappearing-timer change went to WhatsApp (`saving`), or WhatsApp
+    /// answered it, for a direct chat or a group. The chat keeps its current
+    /// timer until the answer.
+    TimerSaving {
         chat: ChatId,
         saving: bool,
     },
@@ -1339,8 +1673,42 @@ pub enum Event {
 pub enum GroupEdit {
     /// The new subject.
     Name(String),
+    /// The new description, empty when removed.
+    Description(String),
     /// A new photo, or none.
     Picture { removed: bool },
+    /// The new disappearing-message duration in seconds; zero turns it off.
+    Timer(u32),
+}
+
+/// WhatsApp's answer to a group management command, read on the runtime and
+/// filed by the worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupAnswer {
+    Link {
+        reset: bool,
+        result: Result<crate::group_admin::InviteLink, crate::group_admin::Failure>,
+    },
+    Added(Result<Vec<MemberAnswer>, crate::group_admin::Failure>),
+    Permission {
+        permission: crate::group_admin::Permission,
+        members: bool,
+        result: Result<(), crate::group_admin::Failure>,
+    },
+    Member {
+        member: ChatId,
+        change: crate::group_admin::MemberChange,
+        result: Result<Vec<MemberAnswer>, crate::group_admin::Failure>,
+    },
+}
+
+/// What WhatsApp said about one person in a member change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberAnswer {
+    /// The person's canonical chat id.
+    pub id: ChatId,
+    /// WhatsApp's error code for them, such as "403"; `None` when accepted.
+    pub error: Option<String>,
 }
 
 /// A group WhatsApp created for `Command::CreateGroup`, read on the runtime
@@ -1356,6 +1724,8 @@ pub struct CreatedGroup {
     pub admin: bool,
     pub info_locked: bool,
     pub read_only: bool,
+    /// Its permissions and admins.
+    pub settings: crate::model::GroupSettings,
     /// When WhatsApp made it, in Unix seconds.
     pub created_at: i64,
     /// The people picked whom WhatsApp did not add. Empty when the members
@@ -1374,15 +1744,27 @@ pub struct ChannelPicture {
     pub preview: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFailure {
+    Offline,
+    Read,
+    Sync,
+    Write,
+}
+
 /// Why the worker refused a send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
+    Blocked,
     /// There is no WhatsApp connection.
     Offline,
     /// The message being replied to cannot be quoted, because its row or its
-    /// original protobuf is missing, unreadable, or deleted. Sending anyway
+    /// original protobuf is missing, unreadable, or deleted (a view-once
+    /// message is quoted from its row, without one). Sending anyway
     /// would deliver the reply without its quote.
     QuoteUnavailable,
+    /// View-once sends must be one photo, not a document or batch.
+    UnsupportedViewOnce,
 }
 
 /// The content of a refused send.
@@ -1399,12 +1781,14 @@ pub enum Unsent {
     Files {
         paths: Vec<PathBuf>,
         documents: bool,
+        view_once: bool,
         caption: Option<String>,
     },
     Image {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+        view_once: bool,
         caption: Option<String>,
     },
     Sticker,
@@ -1423,6 +1807,10 @@ pub struct Backend {
     offline: bool,
     #[cfg(any(test, feature = "demo"))]
     demo_commands: Option<std::sync::Mutex<Vec<Command>>>,
+    #[cfg(any(test, feature = "demo"))]
+    demo_events: Option<std::sync::mpsc::Sender<Event>>,
+    #[cfg(any(test, feature = "demo"))]
+    demo_waker: Waker,
 }
 
 impl Backend {
@@ -1457,6 +1845,10 @@ impl Backend {
             offline: false,
             #[cfg(any(test, feature = "demo"))]
             demo_commands: None,
+            #[cfg(any(test, feature = "demo"))]
+            demo_events: None,
+            #[cfg(any(test, feature = "demo"))]
+            demo_waker: Waker::default(),
         }
     }
 
@@ -1473,6 +1865,10 @@ impl Backend {
                 offline: true,
                 #[cfg(any(test, feature = "demo"))]
                 demo_commands: None,
+                #[cfg(any(test, feature = "demo"))]
+                demo_events: Some(event_tx.clone()),
+                #[cfg(any(test, feature = "demo"))]
+                demo_waker: Waker::default(),
             },
             event_tx,
         )
@@ -1517,8 +1913,32 @@ impl Backend {
         self.offline
     }
 
+    /// Queue runtime work, or handle local preview work in an offline demo.
     pub fn send(&self, command: Command) {
         if self.offline && !matches!(command, Command::Shutdown) {
+            #[cfg(any(test, feature = "demo"))]
+            if let Command::PreparePicturePreview {
+                target,
+                width,
+                height,
+                rgba,
+            } = &command
+                && let Some(events) = &self.demo_events
+            {
+                let (target, width, height, rgba) = (*target, *width, *height, Arc::clone(rgba));
+                let events = events.clone();
+                let waker = self.demo_waker.clone();
+                // Offline demos use the same command/event boundary, without a WhatsApp runtime.
+                std::thread::Builder::new()
+                    .name("demo-picture-preview".into())
+                    .spawn(move || {
+                        let image = picture_edit::preview(width, height, &rgba);
+                        let _ = events.send(Event::PicturePreviewReady { target, image });
+                        waker.wake();
+                    })
+                    .ok();
+                return;
+            }
             #[cfg(any(test, feature = "demo"))]
             if let Some(commands) = &self.demo_commands {
                 commands
@@ -1529,6 +1949,12 @@ impl Backend {
             return;
         }
         let _ = self.commands.send(command);
+    }
+
+    /// Wake an offline demo when its local preview worker finishes.
+    #[cfg(any(test, feature = "demo"))]
+    pub(crate) fn attach_demo_window(&self, ctx: &egui::Context) {
+        self.demo_waker.attach(ctx);
     }
 
     /// Captures real UI commands for an offline demo's local responder.
@@ -1547,6 +1973,16 @@ impl Backend {
             })
     }
 
+    /// Delivers `event` to the window as the worker would, for an offline
+    /// demo playing the other side of a call.
+    #[cfg(any(test, feature = "demo"))]
+    pub(crate) fn deliver_demo_event(&self, event: Event) {
+        if let Some(events) = &self.demo_events {
+            let _ = events.send(event);
+            self.demo_waker.wake();
+        }
+    }
+
     pub fn poll(&self) -> Vec<Event> {
         self.events.try_iter().collect()
     }
@@ -1557,11 +1993,38 @@ impl Backend {
         self.startup.take()
     }
 
-    pub fn shutdown(&mut self) {
+    /// Asks the runtime to stop, without waiting for it.
+    pub fn request_shutdown(&mut self) {
         self.startup.take();
         self.send(Command::Shutdown);
+    }
+
+    /// Stops the runtime and waits for it, however long that takes, as
+    /// removing an account must before deleting its files.
+    pub fn shutdown(&mut self) {
+        self.request_shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    /// Waits for a runtime asked to stop until `deadline`, and leaves it to
+    /// end with the process after that. Quitting must not hang on archive
+    /// work: the window is gone, and the tray's Show did nothing for as long
+    /// as the first sync took (#839). The archive is SQLite, so writes cut
+    /// short roll back. False when the runtime was still running.
+    pub fn wait_for_shutdown(&mut self, deadline: Instant) -> bool {
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                log::warn!("the backend was still busy when ZapFast quit");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = thread.join();
+        true
     }
 }

@@ -9,6 +9,9 @@ protocol. These notes are for coding agents and new contributors.
 - Keep it a small native client. No browser engine, no telemetry, no
   hosted backend, no ZapFast-operated account system. Features never send
   message content to a third party.
+- WhatsApp only. ZapFast is a client for WhatsApp accounts and will not
+  speak other networks or protocols (Matrix, Signal, Telegram, IRC, XMPP)
+  or bridge to them.
 - No automation, ever. ZapFast is for a person reading and writing their
   own chats by hand. It will not have bots, an MCP server, or any API,
   command-line, plugin or scripting interface that reads, exports or sends
@@ -34,6 +37,16 @@ protocol. These notes are for coding agents and new contributors.
 - The protocol comes from whatsapp-rust. Do not reimplement pieces of it
   here, and do not advertise a capability merely because a protobuf field
   for it exists.
+- Nothing ships for one platform only. A feature or theme works on Linux,
+  Windows and macOS, through each platform's own mechanism where they differ
+  and a sensible fallback where one lacks it.
+- Fewer settings. Prefer a good default to a new setting, and never add a
+  setting per preference; a change that needs a new setting needs the
+  maintainer's approval first.
+- Pull requests leave the translation template and catalogs
+  (`assets/i18n/`) alone unless the change is a translation itself: the
+  maintainer regenerates them on `main`, and regenerated catalogs bury the
+  real change and conflict with every other pull request.
 - Do not broaden a task into adjacent features or a general refactor.
   Preserve existing user behaviour unless the task changes it.
 - Current limitations are not product exclusions. Before marking a report
@@ -92,7 +105,8 @@ protocol. These notes are for coding agents and new contributors.
   remembered chat is not being read, so it sends no receipts). Process-wide
   settings (download folder, proxy) go to every backend. `paths.rs` moves a
   single-account layout into `accounts/1/` at startup, after logging starts:
-  it refuses when anything is in the way, copies and reads back the archive's
+  it refuses when anything is in the way (a linked `accounts/1/` wins, and
+  files beside it stay untouched: only an older build makes them), copies and reads back the archive's
   keyring key before moving it, and moves SQLite side files before their
   database. Removing an account deletes its folders after its backend has
   stopped, then its keyring entry.
@@ -105,6 +119,12 @@ protocol. These notes are for coding agents and new contributors.
   migration checkpoints the old WAL and verifies an encrypted staging file before
   atomic replacement. A locked or missing key stops linking; never fall back to
   a disposable archive. Tests use fixtures and mock credentials only.
+  Each history chunk, and each run of runtime events already queued (up to
+  `EVENT_BATCH` or `EVENT_BATCH_TIME`), commits once (`Archive::begin_batch`):
+  committed write by write, a first sync wrote fifteen times the archive's
+  size (#839). Archive transactions are `archive::Batch`es, savepoints that
+  nest inside such a batch, never `unchecked_transaction` on the worker's
+  connection. `write_batching::history_write_bench` (ignored) measures it.
 - `src/model.rs` holds the app's own types. Views never touch a protobuf;
   the worker translates in `classify()` and `parse_conversation()`.
 - A motion photo is a photo plus a short clip sent as a second message in an
@@ -203,9 +223,12 @@ protocol. These notes are for coding agents and new contributors.
   call per account; the window (`app/calls.rs`) holds one call across all
   accounts with its `AccountId`, routes call actions to that account's
   backend, and declines another account's offer while one is up.
-  Group calls are not available yet: `calls::GROUP_CALLS_ENABLED` is
-  `false` (a real test carried no media either way), and everything below
-  about them is the code behind that switch, kept compiling and tested
+  Group calls are experimental: `calls::GROUP_CALLS_ENABLED` is `true` since
+  0.20. A three-person test carried audio every way and video both ways, but
+  our video froze every few seconds, since the library sends video FEC in
+  1:1 calls only (a guessed hop-by-hop group FEC, whatsapp-rust branch
+  `voip-group-video-fec`, made the SFU drop our media altogether). The switch
+  stays, kept compiling and tested both ways
   (`calls::override_group_calls` sets it per test thread). Read it through
   `calls::group_calls_enabled()`. While it is off a group has no call
   button and no call back (`ui::conversation::callable`, `call_menu`, the
@@ -280,6 +303,9 @@ protocol. These notes are for coding agents and new contributors.
   never the rate, which a calm picture stays well under, it caps us at 90% of it, once word 0, the
   bytes received, passes 500 kB, since it starts from nothing), and climbs
   quickly back only to just under where loss was last reported, slowly past it;
+  loss from 2% to 10%, and each keyframe request, hold it from rising for
+  `CONGESTION_HOLD` without cutting it (an iPhone asks once near the start of
+  a clean call too);
   keyframes go out every five seconds unasked, and on the peer's request. In a
   1:1 call the library sends XOR repair packets (FEC) beside the video, which an
   iPhone relies on since it never NACKs; the rate chosen is the total on the
@@ -349,7 +375,13 @@ protocol. These notes are for coding agents and new contributors.
   platform's picture over it afterwards (Apple Color Emoji, Segoe UI Emoji
   through DirectWrite, or the desktop's bitmap emoji font, with the bundled
   Noto behind them). New pictures are drawn on its worker thread; tests and
-  demo builds draw them inside the frame. The interface font is the
+  demo builds draw them inside the frame. Pickers and `:` completions list
+  emoji through `emoji::catalogue` / `emoji::lookup`, which stop at the
+  bundled font's emoji version (`BUNDLED_VERSION`), so an `emojis` update
+  never offers an emoji no font draws; when updating
+  `assets/fonts/NotoColorEmoji.ttf` (the CBDT build from googlefonts/noto-emoji,
+  not COLRv1), raise it, and a test checks the font draws every offered emoji.
+  The interface font is the
   platform's own (`fastframe_fonts::Primary::System`), and Inter in tests.
   fastframe-emoji's `EmojiPlugin` (added in `App::attach`) colours the
   emoji in every other egui text: labels, menus, tooltips, text fields. It
@@ -441,6 +473,29 @@ protocol. These notes are for coding agents and new contributors.
   people picked but missing are reported by name. `group_created` files the
   chat named, with its members and our admin rights, before
   `Event::GroupCreated` opens it.
+- Group management lives in the info panel (`src/group_admin.rs`, the worker's
+  `backend/worker/group_admin.rs`). The metadata's permissions and admins are
+  filed as `chats.group_settings` (JSON, NULL until known; `Chat::group_settings`),
+  read by `settings_of`: only an explicit `all_member_add`/`all_member_link`
+  lets members add people or see the link, WhatsApp's default being admins
+  only. `Chat::can_add_members`, `can_share_invite_link` and `can_manage_group`
+  gate the panel's Add members, Invite via link, Group permissions (an
+  `InfoView::Permissions` page: `set_locked`, `set_announce`,
+  `set_member_add_mode`, `set_membership_approval`) and each member's menu
+  (`promote_participants`, `demote_participants`, `remove_participants`);
+  the worker checks the same rights again. Add members is New group's
+  `Draft` made with `Draft::adding` (the choosing step alone, without the
+  group's members), sent with `add_participants`, whose per-person error
+  codes name who was refused and why (403 privacy, 408 recently left; 409,
+  already in, counts as added). Each answer returns as
+  `Command::GroupManaged`; `group_managed` files only what WhatsApp accepted
+  and bumps `settings_generation`, so metadata asked for earlier (the library
+  joins a query in flight) cannot undo it, and a refusal re-asks the
+  metadata. The invite link (`groups().get_invite_link`, `reset` revokes it)
+  is a secret: `group_admin::InviteLink` hides it from `Debug`, it is never
+  logged or stored, and the window keeps it only while the panel shows its
+  group (`App::info_invite`). The library has no simple way to send an
+  invite message, so people WhatsApp refuses are named and pointed to the link.
 - Mentioning everyone uses the visible body token `@all` and bit 1 of
   `ContextInfo.non_jid_mentions` (`src/mentions.rs`). Localized words
   (`@todos` in Portuguese, and the one-word alias of each other language)
@@ -542,8 +597,11 @@ protocol. These notes are for coding agents and new contributors.
   gets the embedded icon, while a packaged app keeps its bundle icon. The
   unread-chat count stays in ZapFast and survives window replacement.
   Clicking the macOS menu-bar icon opens its menu; **Show or hide ZapFast**
-  toggles the window, and clicking the Dock icon shows it.
-  Closing keeps ZapFast running only while `Tray::is_shown`: on Linux the
+  toggles the window, and clicking the Dock icon shows it. On macOS closing
+  always keeps ZapFast running, as other Mac apps do: `App::dock` (a
+  `fastframe_tray::Dock`) hears Dock clicks with or without a menu-bar item,
+  and the setting, shown there as **Show in the menu bar**, decides only the
+  item. Elsewhere closing keeps ZapFast running only while `Tray::is_shown`: on Linux the
   item exists before a panel shows it (a start at login beats the panel, and
   GNOME's tray watcher) and registers once one appears. A hidden start with
   an item no panel shows yet waits `TRAY_WAIT` (30 s) for one in
@@ -623,6 +681,11 @@ protocol. These notes are for coding agents and new contributors.
   History `MESSAGE_EDIT` entries carry full snapshots, unlike live edit events:
   keep their envelope timestamp/order and normalize the body and target id.
   Do not require a separate original or create a bubble under the edit id.
+  An edit made before linking can arrive as a `secretEncryptedMessage`
+  MESSAGE_EDIT: `parse_conversation` files it as a `SealedEdit` under the
+  original's id, and the worker opens it with the original's secret (the
+  chunk's, the archive's, or the entry's own) before filing the snapshot;
+  one it cannot open is not filed.
   Count-only diagnostics can distinguish malformed snapshots from storage failures.
 - Scrolling comes from fastframe-scroll: `App::scrolling.apply` runs first
   in each unlocked frame and sets the wheel step (120 points a notch), and on
@@ -714,6 +777,13 @@ A release is not finished when the tag is pushed. Do these in order:
    file as the release description, and a stable tag without it fails. Link
    screenshots at the release's asset URLs
    (`https://github.com/crmne/zapfast/releases/download/vX.Y.Z/NAME.png`).
+   In the same commit, set `zapfast_version` in `docs/_config.yml` and the
+   version menu in `docs/_data/versions.yml` to the new version. The site's
+   `/` is built from the newest release tag and published when the release
+   is, by which time its files exist, so the tag's docs must already name
+   it; a version set after tagging only reaches `/next/` until the release
+   after. The menu lists only the current version, which points to
+   `/download/`, and the Changelog link; do not add older versions to it.
    Run the full checks, commit, and push `main`. Before tagging, verify the
    release commit is reachable from `origin/main` so the binaries report the
    right version and the release contains the canonical history.
@@ -722,12 +792,10 @@ A release is not finished when the tag is pushed. Do these in order:
 3. Upload the screenshots to the release as assets with the names the notes
    link, then open the published release and check the text, every image,
    and every download link. Never leave generated placeholder notes.
-4. After the release files exist, update both `zapfast_version` in
-   `docs/_config.yml` and the version menu in `docs/_data/versions.yml`.
-   The menu lists only the current version, which points to `/download/`,
-   and the Changelog link; do not add older versions to it. Never point the
-   download page at files that do not exist yet. Set `release_asset_prefix` to
-   `zapfast` and `release_app_name` to `ZapFast` only once those assets exist.
+4. Once the release is published, open zapfast.rocks and check that the
+   download page offers the new version and every download link loads. Set
+   `release_asset_prefix` to `zapfast` and `release_app_name` to `ZapFast`
+   only once those assets exist.
 5. Update the AUR packages from the templates in `packaging/arch/`. The shared
    packaging workflow generates versions, hashes and `.SRCINFO` after the
    release exists, and publishes when `PUBLISH_AUR` and the required secrets

@@ -97,6 +97,11 @@ impl Worker {
                         }
                     };
                     let (participants, admin) = group_members(&metadata.participants, &me, &lids);
+                    let mut settings = super::group_admin::settings_of(&metadata, &lids);
+                    if !confirmed {
+                        // The creator is an admin whatever the answer says.
+                        settings.admins.extend(me.iter().cloned());
+                    }
                     let unadded = if confirmed {
                         crate::new_group::unadded(&picked, &participants)
                     } else {
@@ -114,6 +119,7 @@ impl Worker {
                         admin: admin || !confirmed,
                         info_locked: metadata.is_locked,
                         read_only: metadata.is_announcement && !admin,
+                        settings,
                         created_at: metadata
                             .creation_time
                             .and_then(|at| i64::try_from(at).ok())
@@ -169,6 +175,7 @@ impl Worker {
         let _ = self
             .archive
             .set_group_rights(&chat, group.info_locked, group.admin);
+        let _ = self.archive.set_group_settings(&chat, &group.settings);
         let _ = self.archive.set_group_description(&chat, "");
         let _ = self.archive.touch_activity(&chat, group.created_at);
         self.emit_chat(&chat);
@@ -188,7 +195,7 @@ impl Worker {
     }
 
     /// A member id as the archive files it.
-    fn canonical_id(&self, id: &str) -> ChatId {
+    pub(super) fn canonical_id(&self, id: &str) -> ChatId {
         match Self::jid_of(id) {
             Some(jid) => canonical_jid(&jid, &self.lid_to_pn),
             None => id.to_owned(),
@@ -198,13 +205,31 @@ impl Worker {
 
 /// A JID under its canonical chat id: a privacy id under its phone number
 /// once the mapping is known.
-fn canonical_jid(jid: &Jid, lids: &HashMap<String, String>) -> String {
+pub(super) fn canonical_jid(jid: &Jid, lids: &HashMap<String, String>) -> String {
     if jid.is_lid()
         && let Some(pn) = lids.get(jid.user_base())
     {
         return format!("{pn}@s.whatsapp.net");
     }
     jid.to_non_ad_string()
+}
+
+/// The privacy ids WhatsApp names a phone number for in a group's members,
+/// as (privacy id, number). A member's number is otherwise only learned from
+/// their messages, and until then they show as WhatsApp's masked label.
+pub(super) fn known_numbers(participants: &[GroupParticipant]) -> Vec<(String, String)> {
+    participants
+        .iter()
+        .filter_map(|participant| {
+            let phone = participant.phone_number.as_ref()?;
+            let lid = participant
+                .lid
+                .as_ref()
+                .or(Some(&participant.jid))
+                .filter(|jid| jid.is_lid())?;
+            Some((lid.user_base().to_owned(), phone.user_base().to_owned()))
+        })
+        .collect()
 }
 
 /// A group's members under canonical chat ids, and whether one of `me`
@@ -288,6 +313,24 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_groups_metadata_teaches_the_numbers_it_names() {
+        let mut named = GroupParticipant::new("100@lid".parse().unwrap());
+        named.phone_number = Some("233201234542@s.whatsapp.net".parse().unwrap());
+        let mut addressed_by_phone =
+            GroupParticipant::new("393331234567@s.whatsapp.net".parse().unwrap());
+        addressed_by_phone.phone_number = Some("393331234567@s.whatsapp.net".parse().unwrap());
+        addressed_by_phone.lid = Some("200@lid".parse().unwrap());
+        let hidden = GroupParticipant::new("300@lid".parse().unwrap());
+        assert_eq!(
+            known_numbers(&[named, addressed_by_phone, hidden]),
+            [
+                ("100".to_owned(), "233201234542".to_owned()),
+                ("200".to_owned(), "393331234567".to_owned())
+            ]
+        );
+    }
+
     fn create(subject: &str, members: &[&str]) -> Command {
         Command::CreateGroup {
             request: 7,
@@ -342,6 +385,7 @@ mod tests {
                     admin: true,
                     info_locked: false,
                     read_only: false,
+                    settings: Default::default(),
                     created_at: 1_700_000_000,
                     unadded: vec![grace.into()],
                 }),

@@ -7,9 +7,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, MediaItem, Message};
+use crate::model::{
+    Chat, ChatKind, Contact, Content, Delivery, GroupSettings, LastMessage, MediaItem, Message,
+};
 
+mod broadcast_lists;
+pub use broadcast_lists::Adopted;
 mod calls;
+pub mod chat_export;
 pub use calls::CALL_LOG_LIMIT;
 mod drafts;
 mod encryption;
@@ -22,8 +27,12 @@ mod pins;
 pub use pins::{Pinned, Pinner};
 mod polls;
 mod receipts;
+mod reconcile;
+#[cfg(test)]
+mod reconcile_tests;
 mod stars;
 mod stickers;
+mod transcripts;
 pub use polls::PollVote;
 pub use stars::Starred;
 pub use stickers::FavoriteSticker;
@@ -59,6 +68,52 @@ pub struct Archive {
 }
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
+
+/// Writes that commit together, or not at all.
+///
+/// Batches nest. The outermost one is the transaction; inside another it is
+/// a savepoint, so a step that fails rolls back alone and the writes around
+/// it still commit, as when each step committed on its own. Dropped without
+/// `commit`, it rolls back its own writes.
+pub(crate) struct Batch<'a> {
+    connection: &'a Connection,
+    open: bool,
+}
+
+impl<'a> Batch<'a> {
+    pub(crate) fn begin(connection: &'a Connection) -> Result<Self> {
+        connection.execute_batch("SAVEPOINT batch")?;
+        Ok(Self {
+            connection,
+            open: true,
+        })
+    }
+
+    /// A failed commit rolls back, as rusqlite's own transaction does.
+    pub(crate) fn commit(mut self) -> Result<()> {
+        self.connection.execute_batch("RELEASE batch")?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self
+                .connection
+                .execute_batch("ROLLBACK TO batch; RELEASE batch");
+        }
+    }
+}
+
+impl std::ops::Deref for Batch<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.connection
+    }
+}
 
 /// Marks an archived photo whose clip is known as a motion photo. Only the
 /// photo's own sender can give it a clip.
@@ -162,6 +217,9 @@ CREATE TABLE IF NOT EXISTS group_receipts (
 CREATE TRIGGER IF NOT EXISTS delete_group_receipts AFTER DELETE ON messages BEGIN
     DELETE FROM group_receipts WHERE chat = OLD.chat AND id = OLD.id;
 END;
+-- One person can be both a privacy id and a phone number; merging the two
+-- looks receipts up by recipient, and the primary key cannot serve that.
+CREATE INDEX IF NOT EXISTS group_receipts_by_recipient ON group_receipts (recipient);
 ";
 
 const CHAT_COLUMNS: &str =
@@ -170,7 +228,8 @@ const CHAT_COLUMNS: &str =
                     c.pinned_at, c.ephemeral_expiration, c.locked, c.group_subject_known,
                     c.notification_sound, c.marked_unread,
                     (SELECT f.position FROM favorites f WHERE f.chat = c.id), c.left,
-                    c.info_locked, c.group_admin, c.group_description, c.voice_speed";
+                    c.info_locked, c.group_admin, c.group_description, c.voice_speed,
+                    c.group_settings";
 
 /// Adds columns introduced after the initial schema when missing.
 const MIGRATIONS: &[(&str, &str, &str)] = &[
@@ -216,8 +275,60 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("chats", "history_start", "INTEGER NOT NULL DEFAULT 0"),
     // NULL plays voice messages at the speed in Settings.
     ("chats", "voice_speed", "REAL"),
+    // A group's permissions and admins as JSON; NULL until its metadata says.
+    ("chats", "group_settings", "TEXT"),
     ("contacts", "first_name", "TEXT"),
+    // The broadcast list a received message came through, for its receipts.
+    ("messages", "broadcast_list", "TEXT"),
 ];
+
+/// One copy of a message that a merge meets twice, as stored.
+struct MessageCopy {
+    chat: String,
+    json: String,
+    /// What this build reads `json` as; `None` for content a newer build
+    /// wrote that it cannot read.
+    content: Option<Content>,
+    edited: bool,
+    reactions: Vec<crate::model::Reaction>,
+}
+
+impl MessageCopy {
+    fn new(chat: &str, json: String, edited: bool, reactions: &str) -> Self {
+        Self {
+            chat: chat.to_owned(),
+            content: serde_json::from_str(&json).ok(),
+            json,
+            edited,
+            reactions: serde_json::from_str(reactions).unwrap_or_default(),
+        }
+    }
+}
+
+/// How a merge settles the reactions of a message it meets twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reactions {
+    /// As the upsert left them: the kept row's, or the other copy's when
+    /// the kept row has none. A privacy-id merge keeps this rule.
+    Kept,
+    /// Both copies', one per person.
+    Both,
+}
+
+/// Whether a merge may replace this content with another copy's: an
+/// unsupported or unreadable placeholder, or a phone-only one other than
+/// view-once, which is the message's final state on a linked device.
+fn replaceable(content: &Content) -> bool {
+    matches!(
+        content,
+        Content::Unsupported { .. }
+            | Content::PhoneOnly {
+                view_once: false,
+                ..
+            }
+    )
+}
+
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
                  SELECT rowid FROM messages WHERE chat = c.id ORDER BY timestamp DESC, COALESCE(history_order, 9223372036854775807) DESC, rowid DESC LIMIT 1
@@ -275,6 +386,9 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         admin: row.get(24)?,
         group_description: row.get(25)?,
         voice_speed: row.get(26)?,
+        group_settings: row
+            .get::<_, Option<String>>(27)?
+            .and_then(|settings| serde_json::from_str(&settings).ok()),
     })
 }
 
@@ -339,6 +453,7 @@ fn searched_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         mentions: serde_json::from_str(&mentions).unwrap_or_default(),
         forwarded: row.get(13)?,
         thumbnail: row.get(11)?,
+        transcript: None,
     })
 }
 
@@ -396,6 +511,13 @@ fn kind_from_name(name: &str) -> ChatKind {
 /// rather than every photo it ever held.
 pub const GALLERY_PAGE: usize = 200;
 
+/// `meta` keys for the phone's "Keep chats archived" and when it changed.
+const UNARCHIVE_CHATS: &str = "unarchive_chats";
+const UNARCHIVE_CHATS_AT: &str = "unarchive_chats_at";
+/// `meta` keys for the phone's "Disable link previews" and when it changed.
+const LINK_PREVIEWS_DISABLED: &str = "link_previews_disabled";
+const LINK_PREVIEWS_DISABLED_AT: &str = "link_previews_disabled_at";
+
 impl Archive {
     /// Unlocks the on-disk archive with its OS keyring key, migrating plaintext
     /// archives before their first encrypted use. Never falls back to plaintext.
@@ -406,6 +528,43 @@ impl Archive {
 
     fn open_with_key(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
         Ok(Self::prepare(encryption::open(path, key)?)?)
+    }
+
+    /// An encrypted archive with a fixture key, for tests and benchmarks that
+    /// must write what a real one writes.
+    #[cfg(test)]
+    pub(crate) fn open_encrypted_for_test(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
+        Self::open_with_key(path, key)
+    }
+
+    /// Starts writes that commit together at `end_batch`, for a caller that
+    /// cannot hold a `Batch` across its work. Each call must be paired with
+    /// one `end_batch`. Batches opened meanwhile nest inside it.
+    pub fn begin_batch(&self) -> Result<()> {
+        self.connection.execute_batch("SAVEPOINT outer_batch")
+    }
+
+    /// Commits the writes since `begin_batch`. When the commit fails, they
+    /// roll back, so no transaction is left open.
+    pub fn end_batch(&self) -> Result<()> {
+        if let Err(error) = self.connection.execute_batch("RELEASE outer_batch") {
+            let _ = self
+                .connection
+                .execute_batch("ROLLBACK TO outer_batch; RELEASE outer_batch");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_batch_for_test(&self) -> bool {
+        !self.connection.is_autocommit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_messages_for_test(&self) -> Result<i64> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -422,6 +581,7 @@ impl Archive {
         connection.execute_batch(favorites::SCHEMA)?;
         connection.execute_batch(stars::SCHEMA)?;
         connection.execute_batch(pins::SCHEMA)?;
+        connection.execute_batch(transcripts::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?
@@ -433,6 +593,7 @@ impl Archive {
                 ))?;
             }
         }
+        connection.execute_batch(broadcast_lists::INDEX)?;
         favorites::adopt_local_marks(&connection)?;
         Self::prune_receipts(&connection)?;
         Ok(Self { connection })
@@ -525,6 +686,32 @@ impl Archive {
         Ok(())
     }
 
+    /// Records a group's permissions and admins, from its metadata or a
+    /// change WhatsApp accepted.
+    pub fn set_group_settings(&self, id: &str, settings: &GroupSettings) -> Result<()> {
+        self.connection.execute(
+            "UPDATE chats SET group_settings = ?2 WHERE id = ?1",
+            params![
+                id,
+                serde_json::to_string(settings).unwrap_or_else(|_| "{}".into())
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the group's members alone, as a member change WhatsApp
+    /// accepted leaves them.
+    pub fn set_participants(&self, id: &str, participants: &[String]) -> Result<()> {
+        self.connection.execute(
+            "UPDATE chats SET participants = ?2 WHERE id = ?1",
+            params![
+                id,
+                serde_json::to_string(participants).unwrap_or_else(|_| "[]".into())
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Records who may edit the group's name and photo, from its metadata:
     /// whether only admins may, and whether we are one.
     pub fn set_group_rights(&self, id: &str, info_locked: bool, admin: bool) -> Result<()> {
@@ -586,10 +773,6 @@ impl Archive {
             params![id, name],
         )?;
         Ok(())
-    }
-
-    pub fn set_archived(&self, id: &str, archived: bool) -> Result<()> {
-        self.set_archived_at(id, archived, jiff::Timestamp::now().as_millisecond())
     }
 
     /// Apply archive state in timestamp order, like pin and mute, so history
@@ -716,12 +899,33 @@ impl Archive {
     }
 
     pub fn mark_read(&self, id: &str) -> Result<()> {
+        let through = self
+            .latest_real_message_timestamp(id, i64::MAX)?
+            .unwrap_or(0);
         self.connection.execute(
             "UPDATE chats SET unread = 0, marked_unread = 0, pending_unread = NULL,
-             read_through = MAX(COALESCE(read_through, 0), last_activity) WHERE id = ?1",
-            params![id],
+             read_through = MAX(COALESCE(read_through, 0), ?2) WHERE id = ?1",
+            params![id, through],
         )?;
         Ok(())
+    }
+
+    /// A zero-unread history snapshot reads real messages through its activity
+    /// timestamp, but a protocol-only timer change is not a message position.
+    pub fn mark_history_read_through(&self, id: &str, activity: i64) -> Result<()> {
+        let through = self
+            .latest_real_message_timestamp(id, activity)?
+            .unwrap_or(0);
+        self.mark_read_through(id, through)
+    }
+
+    fn latest_real_message_timestamp(&self, id: &str, through: i64) -> Result<Option<i64>> {
+        self.connection.query_row(
+            "SELECT MAX(timestamp) FROM messages
+                 WHERE chat = ?1 AND id NOT LIKE 'zapfast-timer-%' AND timestamp <= ?2",
+            params![id, through],
+            |row| row.get(0),
+        )
     }
 
     /// A read on another device covers messages up to its position, not newer
@@ -730,7 +934,7 @@ impl Archive {
         self.connection.execute(
             "UPDATE chats SET read_through = MAX(COALESCE(read_through, 0), ?2),
              unread = MIN(unread, (SELECT COUNT(*) FROM messages
-                 WHERE chat = ?1 AND from_me = 0
+                 WHERE chat = ?1 AND from_me = 0 AND id NOT LIKE 'zapfast-timer-%'
                  AND timestamp > MAX(COALESCE(read_through, 0), ?2))) WHERE id = ?1",
             params![id, timestamp],
         )?;
@@ -746,7 +950,7 @@ impl Archive {
                  (SELECT timestamp FROM messages WHERE chat = ?1 AND id = ?2)),
              unread = MIN(unread, (SELECT COUNT(*) FROM messages m
                  JOIN messages boundary ON boundary.chat = m.chat AND boundary.id = ?2
-                 WHERE m.chat = ?1 AND m.from_me = 0
+                 WHERE m.chat = ?1 AND m.from_me = 0 AND m.id NOT LIKE 'zapfast-timer-%'
                  AND (m.timestamp > boundary.timestamp
                       OR (m.timestamp = boundary.timestamp AND
                           (COALESCE(m.history_order, 9223372036854775807), m.rowid) >
@@ -797,7 +1001,8 @@ impl Archive {
             return Ok(unread);
         };
         let remaining: u32 = self.connection.query_row(
-            "SELECT COUNT(*) FROM messages WHERE chat = ?1 AND from_me = 0 AND timestamp > ?2",
+            "SELECT COUNT(*) FROM messages WHERE chat = ?1 AND from_me = 0
+             AND id NOT LIKE 'zapfast-timer-%' AND timestamp > ?2",
             params![id, through],
             |row| row.get(0),
         )?;
@@ -902,7 +1107,7 @@ impl Archive {
     pub fn unread_incoming(&self, chat: &str, limit: u32) -> Result<Vec<(String, String)>> {
         let mut statement = self.connection.prepare(
             "SELECT id, sender FROM messages WHERE chat = ?1 AND from_me = 0
-             AND id NOT LIKE 'zapfast-call-%'
+             AND id NOT LIKE 'zapfast-call-%' AND id NOT LIKE 'zapfast-timer-%'
              AND timestamp >= COALESCE((SELECT read_through FROM chats WHERE id = ?1), -1)
              ORDER BY timestamp DESC, COALESCE(history_order, 9223372036854775807) DESC, rowid DESC LIMIT ?2",
         )?;
@@ -940,8 +1145,11 @@ impl Archive {
             return Ok(None);
         };
         media.path = path.map(Path::to_path_buf);
-        self.set_content(chat, id, &message.content, message.edited)?;
-        Ok(Some(message))
+        if self.set_content(chat, id, &message.content, message.edited)? {
+            Ok(Some(message))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Keeps the download keys of a motion photo's clip and marks its photo.
@@ -979,15 +1187,16 @@ impl Archive {
             .optional()
     }
 
-    pub fn put_motion_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<()> {
+    /// Returns whether the photo's updated path was actually written.
+    pub fn put_motion_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<bool> {
         let Some(mut message) = self.message(chat, id)? else {
-            return Ok(());
+            return Ok(false);
         };
         if let Content::Image { motion, .. } = &mut message.content {
             motion.get_or_insert_default().path = path.map(Path::to_path_buf);
-            self.set_content(chat, id, &message.content, message.edited)?;
+            return self.set_content(chat, id, &message.content, message.edited);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Returns all recorded motion clip paths.
@@ -1044,7 +1253,7 @@ impl Archive {
     /// Stores a privacy id mapping and reconciles history already filed under
     /// the privacy id with the canonical phone-number chat.
     pub fn put_lid(&self, lid: &str, pn: &str) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = Batch::begin(&self.connection)?;
         let lid_chat = format!("{lid}@lid");
         let phone_chat = format!("{pn}@s.whatsapp.net");
         Self::merge_group_recipient(&transaction, &lid_chat, &phone_chat)?;
@@ -1116,9 +1325,10 @@ impl Archive {
              FROM chats WHERE id = ?1",
             params![lid_chat, phone_chat],
         )?;
+        let copies = self.duplicate_copies(&lid_chat, &phone_chat)?;
         transaction.execute(
-            "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order)
-             SELECT ?2, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order
+            "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list)
+             SELECT ?2, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list
              FROM messages WHERE chat = ?1 AND timestamp > COALESCE(
                 (SELECT through FROM chat_removals WHERE chat = ?2), -1)
              ON CONFLICT(chat, id) DO UPDATE SET
@@ -1135,9 +1345,33 @@ impl Archive {
                 forwarded = MAX(messages.forwarded, excluded.forwarded),
                 delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
                 read_at = COALESCE(messages.read_at, excluded.read_at),
-                history_order = COALESCE(messages.history_order, excluded.history_order)",
+                history_order = COALESCE(messages.history_order, excluded.history_order),
+                broadcast_list = COALESCE(messages.broadcast_list, excluded.broadcast_list)",
             params![lid_chat, phone_chat],
         )?;
+        Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
+        // The messages now live under the phone chat; their transcripts must
+        // move before the LID rows are purged, or the delete trigger takes
+        // them along. Only rows whose message was actually copied come over,
+        // and never onto a message the sender has since revoked; a newer text
+        // already in the phone chat wins over an older one from the LID chat.
+        transaction.execute(
+            "INSERT INTO transcripts (chat, id, text, engine, created_at)
+             SELECT ?2, t.id, t.text, t.engine, t.created_at
+             FROM transcripts t
+             WHERE t.chat = ?1
+               AND EXISTS (SELECT 1 FROM messages m
+                   WHERE m.chat = ?2 AND m.id = t.id
+                     AND NOT (json_valid(m.content)
+                         AND json_extract(m.content, '$.kind') = 'revoked'))
+             ON CONFLICT(chat, id) DO UPDATE SET
+                text = excluded.text,
+                engine = excluded.engine,
+                created_at = excluded.created_at
+             WHERE excluded.created_at > transcripts.created_at",
+            params![lid_chat, phone_chat],
+        )?;
+        self.settle_duplicates(&phone_chat, copies, Reactions::Kept)?;
         transaction.execute(
             "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
             params![lid_chat, phone_chat],
@@ -1228,6 +1462,196 @@ impl Archive {
         transaction.execute("DELETE FROM chats WHERE id = ?1", params![lid_chat])?;
         transaction.commit()?;
         Ok(changed > 0 || favorite || removed > 0 || had_lid_chat)
+    }
+
+    /// Both copies of each message that merging `from` into `to` meets and
+    /// on which they differ: the rows of `from` past `to`'s removal point
+    /// that `to` holds as well. Raw messages are not read here: a merge
+    /// fetches one only for the copy whose content it takes.
+    fn duplicate_copies(&self, from: &str, to: &str) -> Result<Vec<(String, [MessageCopy; 2])>> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.id, f.content, f.edited, f.reactions, t.content, t.edited, t.reactions
+             FROM messages f JOIN messages t ON t.chat = ?2 AND t.id = f.id
+             WHERE f.chat = ?1 AND f.timestamp > COALESCE(
+                (SELECT through FROM chat_removals WHERE chat = ?2), -1)
+             AND (f.content <> t.content OR f.reactions <> t.reactions)
+             ORDER BY f.id",
+        )?;
+        let rows = statement.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                [
+                    MessageCopy::new(from, row.get(1)?, row.get(2)?, &row.get::<_, String>(3)?),
+                    MessageCopy::new(to, row.get(4)?, row.get(5)?, &row.get::<_, String>(6)?),
+                ],
+            ))
+        })?;
+        rows.collect()
+    }
+
+    fn stored_copy(&self, chat: &str, id: &str) -> Result<Option<MessageCopy>> {
+        self.connection
+            .query_row(
+                "SELECT content, edited, reactions FROM messages WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |row| {
+                    Ok(MessageCopy::new(
+                        chat,
+                        row.get(0)?,
+                        row.get(1)?,
+                        &row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+    }
+
+    /// Settles a merged message that `chat` met twice, after the merge's
+    /// upsert kept one copy's content. `copies` are the copy merged in and
+    /// the copy that was there, as they were before it.
+    ///
+    /// Content this build cannot read, which a newer build wrote, is kept as
+    /// it is. Otherwise a deletion for everyone on either copy stands; real
+    /// content beats a placeholder (unsupported or unreadable, or phone-only
+    /// other than view-once, which is final), together with its raw
+    /// message; and a file either copy downloaded stays. With
+    /// [`Reactions::Both`] the reactions of both copies are kept, one per
+    /// person; with [`Reactions::Kept`] they stay as the upsert left them.
+    fn settle_duplicates(
+        &self,
+        chat: &str,
+        copies: Vec<(String, [MessageCopy; 2])>,
+        reactions: Reactions,
+    ) -> Result<()> {
+        for (id, copies) in copies {
+            let Some(row) = self.stored_copy(chat, &id)? else {
+                continue;
+            };
+            let [_, there] = &copies;
+            if there.content.is_none() {
+                // What was there cannot be read here: it stays as it was.
+                if row.json != there.json || row.edited != there.edited {
+                    self.connection.execute(
+                        "UPDATE messages SET content = ?3, edited = ?4 WHERE chat = ?1 AND id = ?2",
+                        params![chat, id, there.json, there.edited],
+                    )?;
+                }
+            } else if let Some(kept) = &row.content {
+                self.settle_content(chat, &id, kept, row.edited, &copies)?;
+            }
+            if reactions == Reactions::Both {
+                self.merge_reactions(chat, &id, &row.reactions, &copies)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_content(
+        &self,
+        chat: &str,
+        id: &str,
+        kept: &Content,
+        kept_edited: bool,
+        copies: &[MessageCopy; 2],
+    ) -> Result<()> {
+        if copies
+            .iter()
+            .any(|copy| matches!(copy.content, Some(Content::Revoked)))
+        {
+            if !matches!(kept, Content::Revoked) {
+                self.set_content(chat, id, &Content::Revoked, false)?;
+            }
+            return Ok(());
+        }
+        let real = if replaceable(kept) {
+            copies.iter().find(|copy| {
+                copy.content
+                    .as_ref()
+                    .is_none_or(|content| !replaceable(content))
+            })
+        } else {
+            None
+        };
+        if let Some(real) = real {
+            self.connection.execute(
+                "UPDATE messages SET raw = COALESCE(
+                    (SELECT raw FROM messages WHERE chat = ?3 AND id = ?2), raw)
+                 WHERE chat = ?1 AND id = ?2",
+                params![chat, id, real.chat],
+            )?;
+        }
+        let (mut content, edited) = match real {
+            Some(real) => match &real.content {
+                Some(content) => (content.clone(), real.edited),
+                None => {
+                    // Real content from a newer build goes in as it is stored.
+                    self.connection.execute(
+                        "UPDATE messages SET content = ?3, edited = ?4 WHERE chat = ?1 AND id = ?2",
+                        params![chat, id, real.json, real.edited],
+                    )?;
+                    return Ok(());
+                }
+            },
+            None => (kept.clone(), kept_edited),
+        };
+        for copy in copies {
+            if let Some(other) = &copy.content {
+                content.fill_local_paths(other);
+            }
+        }
+        if content != *kept || edited != kept_edited {
+            self.set_content(chat, id, &content, edited)?;
+        }
+        Ok(())
+    }
+
+    /// Adds the reactions of both copies to the kept row's, one per person:
+    /// a reactor known by a privacy id counts as its phone number. Where
+    /// both copies hold one from the same person, the kept row's stays.
+    fn merge_reactions(
+        &self,
+        chat: &str,
+        id: &str,
+        kept: &[crate::model::Reaction],
+        copies: &[MessageCopy; 2],
+    ) -> Result<()> {
+        let mut merged = kept.to_vec();
+        let mut people = kept
+            .iter()
+            .map(|reaction| self.reactor(&reaction.sender))
+            .collect::<Result<Vec<_>>>()?;
+        for reaction in copies.iter().flat_map(|copy| &copy.reactions) {
+            let person = self.reactor(&reaction.sender)?;
+            if !people.contains(&person) {
+                merged.push(crate::model::Reaction {
+                    sender: person.clone(),
+                    ..reaction.clone()
+                });
+                people.push(person);
+            }
+        }
+        if merged != kept {
+            self.connection.execute(
+                "UPDATE messages SET reactions = ?3 WHERE chat = ?1 AND id = ?2",
+                params![chat, id, serde_json::to_string(&merged).unwrap_or_default()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A reactor's phone-number id, when they reacted under a privacy id
+    /// whose number is known.
+    fn reactor(&self, sender: &str) -> Result<String> {
+        let Some(lid) = sender.strip_suffix("@lid") else {
+            return Ok(sender.to_owned());
+        };
+        let pn: Option<String> = self
+            .connection
+            .query_row("SELECT pn FROM lids WHERE lid = ?1", params![lid], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(pn.map_or_else(|| sender.to_owned(), |pn| format!("{pn}@s.whatsapp.net")))
     }
 
     pub fn lids(&self) -> Result<Vec<(String, String)>> {
@@ -1352,10 +1776,12 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(12)?,
                     thumbnail: row.get(10)?,
+                    transcript: None,
                 })
             })?;
         let mut messages: Vec<Message> = rows.collect::<Result<_>>()?;
         messages.reverse();
+        self.attach_transcripts(chat, &mut messages)?;
         Ok(messages)
     }
 
@@ -1379,6 +1805,7 @@ impl Archive {
              FROM messages
              WHERE chat = ?1 AND timestamp >= ?2 AND timestamp < ?3
              AND json_valid(content)
+             AND json_extract(content, '$.kind') != 'disappearing_timer'
              AND (?4 IS NULL OR {SEARCHED_TEXT} LIKE ?4 ESCAPE '\\')
              ORDER BY timestamp DESC, COALESCE(history_order, 9223372036854775807) DESC, rowid DESC
              LIMIT ?5"
@@ -1471,6 +1898,12 @@ impl Archive {
         rows.collect()
     }
 
+    /// Runs `sql` on the archive, for tests that need a row it cannot read.
+    #[cfg(test)]
+    pub(crate) fn execute_for_tests(&self, sql: &str) {
+        self.connection.execute_batch(sql).unwrap();
+    }
+
     /// Returns messages from `from` through `before`, ascending and limited.
     pub fn messages_range(
         &self,
@@ -1515,10 +1948,13 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(12)?,
                     thumbnail: row.get(10)?,
+                    transcript: None,
                 })
             },
         )?;
-        rows.collect()
+        let mut messages: Vec<Message> = rows.collect::<Result<_>>()?;
+        self.attach_transcripts(chat, &mut messages)?;
+        Ok(messages)
     }
 
     /// Returns downloaded stickers we sent (`from_me`) or received, newest
@@ -1699,7 +2135,7 @@ impl Archive {
 
     /// Commits removal, barriers, and pending cleanup for every known identity.
     pub fn delete_message_aliases(&self, chats: &[String], id: &str) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = Batch::begin(&self.connection)?;
         let mut deleted = 0;
         for chat in chats {
             transaction.execute(
@@ -1746,7 +2182,7 @@ impl Archive {
 
     /// Saves authoritative acceptance separately from fallible physical cleanup.
     pub fn confirm_message_removal(&self, account: &str, chats: &[String], id: &str) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = Batch::begin(&self.connection)?;
         // The caller supplies the current protocol account, including before its
         // Connected event. Bind replay checks to that same persisted identity.
         transaction.execute(
@@ -1827,7 +2263,7 @@ impl Archive {
     /// Atomically removes only the range the linked device knew about, keeping
     /// newer messages and a durable barrier against replay after restart.
     pub fn remove_chat_through(&self, chat: &str, through: i64, delete: bool) -> Result<Removed> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = Batch::begin(&self.connection)?;
         let through = self
             .removal_point(chat)?
             .map_or(through, |old| old.max(through));
@@ -1850,7 +2286,8 @@ impl Archive {
             )?;
             self.connection.execute(
                 "UPDATE chats SET unread = MIN(unread, (SELECT COUNT(*) FROM messages
-                    WHERE chat = ?1 AND from_me = 0 AND timestamp > COALESCE(read_through, 0))),
+                    WHERE chat = ?1 AND from_me = 0 AND id NOT LIKE 'zapfast-timer-%'
+                    AND timestamp > COALESCE(read_through, 0))),
                     pending_read = CASE WHEN pending_read <= ?2 THEN NULL ELSE pending_read END
                  WHERE id = ?1",
                 params![chat, through],
@@ -2134,6 +2571,7 @@ impl Archive {
         }
         let mut statement = self.connection.prepare(
             "SELECT id, mentions FROM messages WHERE chat = ?1 AND from_me = 0
+             AND id NOT LIKE 'zapfast-timer-%'
              ORDER BY timestamp DESC, COALESCE(history_order, 9223372036854775807) DESC,
                       rowid DESC
              LIMIT ?2",
@@ -2161,7 +2599,7 @@ impl Archive {
             "SELECT sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at, history_order
              FROM messages WHERE chat = ?1 AND id = ?2",
         )?;
-        statement
+        let message = statement
             .query_row(params![chat, id], |row| {
                 let content: String = row.get(4)?;
                 let quoted: Option<String> = row.get(6)?;
@@ -2187,9 +2625,15 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(11)?,
                     thumbnail: row.get(9)?,
+                    transcript: None,
                 })
             })
-            .optional()
+            .optional()?;
+        let mut message = message;
+        if let Some(message) = &mut message {
+            self.attach_transcripts(chat, std::slice::from_mut(message))?;
+        }
+        Ok(message)
     }
 
     /// Returns the earliest message for phone-history requests.
@@ -2197,7 +2641,9 @@ impl Archive {
         let id: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM messages WHERE chat = ?1 ORDER BY timestamp ASC, COALESCE(history_order, 9223372036854775807) ASC, rowid ASC LIMIT 1",
+                "SELECT id FROM messages WHERE chat = ?1
+                 AND id NOT LIKE 'zapfast-call-%' AND id NOT LIKE 'zapfast-timer-%'
+                 ORDER BY timestamp ASC, COALESCE(history_order, 9223372036854775807) ASC, rowid ASC LIMIT 1",
                 params![chat],
                 |row| row.get(0),
             )
@@ -2246,7 +2692,50 @@ impl Archive {
         Ok(changed > 0)
     }
 
-    /// Advances outgoing messages through `timestamp` to `status` and returns changed ids.
+    /// Replaces the local clock's stamp on a message we sent with the time
+    /// WhatsApp's server acknowledged it, which incoming messages are stamped
+    /// with too, so a reply never sorts above it when this computer's clock is
+    /// ahead. Returns whether the stamp changed.
+    /// The chat's activity follows: an activity time this message set moves
+    /// to the chat's newest message, and later activity stays.
+    pub fn restamp_sent(&self, chat: &str, id: &str, timestamp: i64) -> Result<bool> {
+        let transaction = Batch::begin(&self.connection)?;
+        let Some(old) = transaction
+            .query_row(
+                "SELECT timestamp FROM messages
+                 WHERE chat = ?1 AND id = ?2 AND from_me = 1 AND timestamp != ?3",
+                params![chat, id, timestamp],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "UPDATE messages SET timestamp = ?3 WHERE chat = ?1 AND id = ?2",
+            params![chat, id, timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE chats SET last_activity = MAX(?3, CASE WHEN last_activity = ?2
+                 THEN COALESCE((SELECT MAX(timestamp) FROM messages WHERE chat = ?1), ?3)
+                 ELSE last_activity END)
+             WHERE id = ?1",
+            params![chat, old, timestamp],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Marks an incoming message as played and returns whether it was not yet.
+    pub fn mark_played(&self, chat: &str, id: &str) -> Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND from_me = 0 AND status < ?3",
+            params![chat, id, status_rank(Delivery::Played)],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Advances acknowledged outgoing messages through `timestamp` to `status` and returns changed ids.
     pub fn advance_statuses(
         &self,
         chat: &str,
@@ -2255,24 +2744,25 @@ impl Archive {
         at: i64,
     ) -> Result<Vec<String>> {
         let rank = status_rank(status);
+        let sent = status_rank(Delivery::Sent);
         let mut statement = self.connection.prepare(
-            "SELECT id FROM messages WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3",
+            "SELECT id FROM messages WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?4 AND status < ?3",
         )?;
         let ids: Vec<String> = statement
-            .query_map(params![chat, up_to, rank], |row| row.get(0))?
+            .query_map(params![chat, up_to, rank, sent], |row| row.get(0))?
             .collect::<Result<_>>()?;
         if let Some(column) = stamp_column(status) {
             self.connection.execute(
                 &format!(
                     "UPDATE messages SET status = ?3, {column} = COALESCE({column}, ?4)
-                     WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3"
+                     WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?5 AND status < ?3"
                 ),
-                params![chat, up_to, rank, at],
+                params![chat, up_to, rank, at, sent],
             )?;
         } else {
             self.connection.execute(
-                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3",
-                params![chat, up_to, rank],
+                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?4 AND status < ?3",
+                params![chat, up_to, rank, sent],
             )?;
         }
         Ok(ids)
@@ -2430,6 +2920,68 @@ impl Archive {
         Ok(existing)
     }
 
+    /// The phone's "Keep chats archived", inverted as WhatsApp sends it:
+    /// `Some(true)` when a new message brings an archived chat back. `None`
+    /// until the phone has said.
+    pub fn unarchive_chats(&self) -> Result<Option<bool>> {
+        Ok(self.meta(UNARCHIVE_CHATS)?.map(|value| value == "1"))
+    }
+
+    /// Records the phone's "Keep chats archived" (inverted, as
+    /// [`Archive::unarchive_chats`]) changed at `timestamp` milliseconds,
+    /// unless a newer change is stored, so a replayed snapshot cannot undo
+    /// it. Returns the setting in force.
+    pub fn set_unarchive_chats_at(&self, unarchive: bool, timestamp: i64) -> Result<bool> {
+        let stored = self
+            .meta(UNARCHIVE_CHATS_AT)?
+            .and_then(|value| value.parse::<i64>().ok());
+        if stored.is_some_and(|stored| stored > timestamp) {
+            return Ok(self.unarchive_chats()?.unwrap_or(unarchive));
+        }
+        // One statement, so a failed write leaves the previous pair intact.
+        self.connection.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                UNARCHIVE_CHATS,
+                if unarchive { "1" } else { "0" },
+                UNARCHIVE_CHATS_AT,
+                timestamp.to_string()
+            ],
+        )?;
+        Ok(unarchive)
+    }
+
+    /// The phone's "Disable link previews": `Some(true)` when it is on.
+    /// `None` until the phone has said.
+    pub fn link_previews_disabled(&self) -> Result<Option<bool>> {
+        Ok(self.meta(LINK_PREVIEWS_DISABLED)?.map(|value| value == "1"))
+    }
+
+    /// Records the phone's "Disable link previews" changed at `timestamp`
+    /// milliseconds, unless a newer change is stored, so a replayed snapshot
+    /// cannot undo it. Returns the setting in force.
+    pub fn set_link_previews_disabled_at(&self, disabled: bool, timestamp: i64) -> Result<bool> {
+        let stored = self
+            .meta(LINK_PREVIEWS_DISABLED_AT)?
+            .and_then(|value| value.parse::<i64>().ok());
+        if stored.is_some_and(|stored| stored > timestamp) {
+            return Ok(self.link_previews_disabled()?.unwrap_or(disabled));
+        }
+        // One statement, so a failed write leaves the previous pair intact.
+        self.connection.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                LINK_PREVIEWS_DISABLED,
+                if disabled { "1" } else { "0" },
+                LINK_PREVIEWS_DISABLED_AT,
+                timestamp.to_string()
+            ],
+        )?;
+        Ok(disabled)
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2448,6 +3000,120 @@ impl Archive {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Makes filing the message `id` fail, as a full disk would.
+    pub(crate) fn reject_message(archive: &super::Archive, id: &str) {
+        archive
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_message BEFORE INSERT ON messages WHEN NEW.id = '{id}'
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            ))
+            .unwrap();
+    }
+
+    /// Every row of the tables history fills, in insertion order, to tell
+    /// two archives apart.
+    pub(crate) fn dump(archive: &super::Archive) -> Vec<String> {
+        let mut rows = Vec::new();
+        for table in [
+            "chats",
+            "messages",
+            "contacts",
+            "group_receipts",
+            "lids",
+            "message_removals",
+            "pending_message_removals",
+            "chat_removals",
+            "meta",
+        ] {
+            let mut statement = archive
+                .connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let table_rows = statement
+                .query_map([], |row| {
+                    let values: Vec<rusqlite::types::Value> = (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(format!("{table}: {values:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.extend(table_rows);
+        }
+        rows
+    }
+
+    #[test]
+    fn a_batch_commits_its_writes_together() {
+        let archive = super::Archive::in_memory().unwrap();
+        archive.begin_batch().unwrap();
+        archive.ensure_chat("1@s.whatsapp.net", "One").unwrap();
+        archive.ensure_chat("2@s.whatsapp.net", "Two").unwrap();
+        assert!(archive.in_batch_for_test());
+        archive.end_batch().unwrap();
+        assert!(!archive.in_batch_for_test(), "nothing is left open");
+        assert!(archive.chat("1@s.whatsapp.net").unwrap().is_some());
+        assert!(archive.chat("2@s.whatsapp.net").unwrap().is_some());
+    }
+
+    /// A step that fails inside a batch rolls back alone, as it did when
+    /// it committed by itself, and the steps around it still land.
+    #[test]
+    fn a_failed_step_inside_a_batch_rolls_back_alone() {
+        let archive = super::Archive::in_memory().unwrap();
+        archive.ensure_chat("1@s.whatsapp.net", "One").unwrap();
+        archive
+            .insert_message(&message("1@s.whatsapp.net", "gone", 100, false), None)
+            .unwrap();
+        archive.begin_batch().unwrap();
+        archive.ensure_chat("2@s.whatsapp.net", "Two").unwrap();
+        // A nested batch of its own that fails half way.
+        set_message_deletion_failure(&archive, true);
+        assert!(
+            archive
+                .delete_message_aliases(&["1@s.whatsapp.net".into()], "gone")
+                .is_err()
+        );
+        set_message_deletion_failure(&archive, false);
+        archive.ensure_chat("3@s.whatsapp.net", "Three").unwrap();
+        archive.end_batch().unwrap();
+        assert!(!archive.in_batch_for_test());
+        assert!(archive.chat("2@s.whatsapp.net").unwrap().is_some());
+        assert!(archive.chat("3@s.whatsapp.net").unwrap().is_some());
+        assert!(
+            !archive.message_removed("1@s.whatsapp.net", "gone").unwrap(),
+            "the failed step's barrier rolled back with it"
+        );
+        assert!(
+            archive
+                .message("1@s.whatsapp.net", "gone")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_batch_that_cannot_commit_leaves_no_transaction_open() {
+        let archive = super::Archive::in_memory().unwrap();
+        archive.begin_batch().unwrap();
+        archive.ensure_chat("1@s.whatsapp.net", "One").unwrap();
+        // Something ended the transaction under the batch.
+        archive.connection.execute_batch("ROLLBACK").unwrap();
+        assert!(archive.end_batch().is_err());
+        assert!(!archive.in_batch_for_test());
+        archive.ensure_chat("2@s.whatsapp.net", "Two").unwrap();
+        assert!(archive.chat("2@s.whatsapp.net").unwrap().is_some());
+    }
+
+    pub(crate) fn reject_archive_updates(archive: &super::Archive) {
+        archive.connection.execute_batch(
+            "CREATE TRIGGER reject_archive_update BEFORE UPDATE OF archived ON chats BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+        ).unwrap();
+    }
+
     pub(crate) fn set_derived_update_failure(archive: &super::Archive, fail: bool) {
         archive.connection.execute_batch(if fail {
             "CREATE TRIGGER reject_derived_update BEFORE UPDATE OF content ON messages BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
@@ -2747,7 +3413,235 @@ pub(crate) mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            transcript: None,
         }
+    }
+
+    /// A disappearing-timer notice as the worker files it, under the prefix
+    /// the archive's queries filter on, so a change to either fails a test.
+    pub(crate) fn timer_notice(chat: &str, suffix: &str, timestamp: i64) -> Message {
+        let mut notice = message(
+            chat,
+            &format!("{}{suffix}", crate::model::TIMER_NOTICE_PREFIX),
+            timestamp,
+            false,
+        );
+        notice.content = Content::DisappearingTimer { seconds: 86_400 };
+        notice
+    }
+
+    #[test]
+    fn a_transcript_is_read_with_its_message_and_deleted_with_it() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Fixture").unwrap();
+        archive
+            .insert_message(&message(chat, "voice-1", 10, false), None)
+            .unwrap();
+        archive
+            .insert_message(&message(chat, "voice-2", 11, false), None)
+            .unwrap();
+
+        assert!(
+            archive
+                .set_transcript(chat, "voice-1", "hello there", "test")
+                .unwrap()
+        );
+        // A message that is gone by the time the text arrives keeps no row.
+        assert!(!archive.set_transcript(chat, "gone", "no", "test").unwrap());
+
+        let page = archive.messages(chat, None, 10).unwrap();
+        let first = page.iter().find(|row| row.id == "voice-1").unwrap();
+        assert_eq!(first.transcript.as_deref(), Some("hello there"));
+        let second = page.iter().find(|row| row.id == "voice-2").unwrap();
+        assert!(second.transcript.is_none());
+        // The single-message lookup attaches it too.
+        assert_eq!(
+            archive
+                .message(chat, "voice-1")
+                .unwrap()
+                .unwrap()
+                .transcript
+                .as_deref(),
+            Some("hello there")
+        );
+
+        // A new engine's answer replaces the old text.
+        archive
+            .set_transcript(chat, "voice-1", "hello again", "other")
+            .unwrap();
+        assert_eq!(
+            archive
+                .transcripts(chat, &["voice-1".to_owned()])
+                .unwrap()
+                .get("voice-1")
+                .map(String::as_str),
+            Some("hello again")
+        );
+
+        archive.delete_message(chat, "voice-1").unwrap();
+        assert!(
+            archive
+                .transcripts(chat, &["voice-1".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_transcript_follows_its_message_when_a_lid_chat_becomes_a_phone_chat() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "5511999999999";
+        let pn = "5511888888888";
+        let lid_chat = format!("{lid}@lid");
+        let phone_chat = format!("{pn}@s.whatsapp.net");
+        archive.ensure_chat(&lid_chat, "Lid").unwrap();
+        archive
+            .insert_message(&message(&lid_chat, "voice", 10, false), None)
+            .unwrap();
+        assert!(
+            archive
+                .set_transcript(&lid_chat, "voice", "hello there", "test")
+                .unwrap()
+        );
+
+        archive.put_lid(lid, pn).unwrap();
+
+        assert_eq!(
+            archive
+                .transcripts(&phone_chat, &["voice".to_owned()])
+                .unwrap()
+                .get("voice")
+                .map(String::as_str),
+            Some("hello there")
+        );
+        assert!(
+            archive
+                .transcripts(&lid_chat, &["voice".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_transcript_does_not_follow_its_message_onto_a_revoked_phone_row() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "5511999999999";
+        let pn = "5511888888888";
+        let lid_chat = format!("{lid}@lid");
+        let phone_chat = format!("{pn}@s.whatsapp.net");
+        archive.ensure_chat(&lid_chat, "Lid").unwrap();
+        archive.ensure_chat(&phone_chat, "Phone").unwrap();
+        archive
+            .insert_message(&message(&lid_chat, "voice", 10, false), None)
+            .unwrap();
+        let mut revoked = message(&phone_chat, "voice", 10, false);
+        revoked.content = Content::Revoked;
+        archive.insert_message(&revoked, None).unwrap();
+        assert!(
+            archive
+                .set_transcript(&lid_chat, "voice", "lid text", "test")
+                .unwrap()
+        );
+
+        archive.put_lid(lid, pn).unwrap();
+
+        // The phone row is the one that survives, and it was revoked: the
+        // text the sender removed must not come back with the merge.
+        assert!(
+            archive
+                .transcripts(&phone_chat, &["voice".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Moves a LID chat with a transcript onto its phone chat, with the named
+    /// side 100 seconds older, and answers what the phone chat ended with.
+    fn merge_lid_transcript(lid_is_newer: bool) -> Option<String> {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "5511999999999";
+        let pn = "5511888888888";
+        let lid_chat = format!("{lid}@lid");
+        let phone_chat = format!("{pn}@s.whatsapp.net");
+        archive.ensure_chat(&lid_chat, "Lid").unwrap();
+        archive.ensure_chat(&phone_chat, "Phone").unwrap();
+        archive
+            .insert_message(&message(&lid_chat, "voice", 10, false), None)
+            .unwrap();
+        archive
+            .insert_message(&message(&phone_chat, "voice", 10, false), None)
+            .unwrap();
+        assert!(
+            archive
+                .set_transcript(&lid_chat, "voice", "lid text", "test")
+                .unwrap()
+        );
+        assert!(
+            archive
+                .set_transcript(&phone_chat, "voice", "phone text", "test")
+                .unwrap()
+        );
+        let newer = if lid_is_newer { &lid_chat } else { &phone_chat };
+        archive
+            .connection
+            .execute(
+                "UPDATE transcripts SET created_at = created_at + 100
+                 WHERE chat = ?1 AND id = 'voice'",
+                [newer.as_str()],
+            )
+            .unwrap();
+
+        archive.put_lid(lid, pn).unwrap();
+        archive
+            .transcripts(&phone_chat, &["voice".to_owned()])
+            .unwrap()
+            .get("voice")
+            .cloned()
+    }
+
+    #[test]
+    fn the_newer_transcript_survives_the_lid_merge() {
+        assert_eq!(merge_lid_transcript(false).as_deref(), Some("phone text"));
+        assert_eq!(merge_lid_transcript(true).as_deref(), Some("lid text"));
+    }
+
+    #[test]
+    fn a_revoked_message_loses_its_transcript_and_keeps_it_off() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Fixture").unwrap();
+        archive
+            .insert_message(&message(chat, "voice", 10, false), None)
+            .unwrap();
+        assert!(
+            archive
+                .set_transcript(chat, "voice", "hello there", "test")
+                .unwrap()
+        );
+
+        // A delete for everyone keeps the row and replaces its content.
+        archive
+            .set_content(chat, "voice", &Content::Revoked, false)
+            .unwrap();
+        assert!(
+            archive
+                .transcripts(chat, &["voice".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
+        // A clip that finishes after the revoke writes nothing either.
+        assert!(
+            !archive
+                .set_transcript(chat, "voice", "hello again", "test")
+                .unwrap()
+        );
+        assert!(
+            archive
+                .transcripts(chat, &["voice".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3521,6 +4415,114 @@ pub(crate) mod tests {
         assert_eq!(loaded.disappearing_timer(), Some(86_400));
     }
 
+    /// The system row a timer change leaves is stored as structured content
+    /// and reloads as the same variant, not as prose; search never matches it.
+    #[test]
+    fn a_timer_notice_round_trips_and_stays_out_of_search() {
+        let archive = Archive::in_memory().expect("opens");
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Ada").expect("chat");
+        let mut notice = message(chat, "timer", 100, false);
+        notice.content = Content::DisappearingTimer { seconds: 604_800 };
+        archive.insert_message(&notice, None).expect("insert");
+
+        let loaded = archive
+            .message(chat, "timer")
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(
+            loaded.content,
+            Content::DisappearingTimer { seconds: 604_800 }
+        );
+        assert_eq!(loaded.summary(), "Disappearing messages: 7 days");
+        assert!(
+            archive
+                .search_messages("Disappearing", 10)
+                .expect("search")
+                .is_empty(),
+            "a timer notice is not searchable"
+        );
+        // A date-only search in the chat (an empty needle) is not a text
+        // search: the notice must be kept out of it as well, or it shows as a
+        // result nothing can scroll to.
+        archive
+            .insert_message(&message(chat, "hello", 150, false), None)
+            .expect("insert");
+        let found: Vec<String> = archive
+            .search_chat_messages(chat, "", Some(0), Some(200), 10)
+            .expect("search")
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(found, vec!["hello"], "only real messages are listed");
+    }
+
+    #[test]
+    fn reading_a_chat_uses_the_latest_real_message_not_a_timer_notice() {
+        let archive = Archive::in_memory().expect("opens");
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Ada").expect("chat");
+        archive
+            .insert_message(&message(chat, "real", 100, false), None)
+            .expect("real message");
+        let notice = timer_notice(chat, "change", 300);
+        archive.insert_message(&notice, None).expect("timer notice");
+
+        archive.mark_read(chat).expect("read");
+
+        assert_eq!(
+            archive.read_through(chat).expect("read position"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_zero_unread_snapshot_does_not_read_through_a_timer_notice() {
+        let archive = Archive::in_memory().expect("opens");
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Ada").expect("chat");
+        archive
+            .insert_message(&message(chat, "real", 100, false), None)
+            .expect("real message");
+        let notice = timer_notice(chat, "change", 300);
+        archive.insert_message(&notice, None).expect("timer notice");
+        archive.bump_unread(chat).expect("unread");
+
+        archive
+            .mark_history_read_through(chat, 300)
+            .expect("history snapshot");
+
+        assert_eq!(
+            archive.read_through(chat).expect("read position"),
+            Some(100)
+        );
+        assert_eq!(archive.chat(chat).expect("chat").unwrap().unread, 0);
+    }
+
+    /// A timer notice is not a message the reader owes a receipt for, and it
+    /// must not keep a chat looking unread after the real message was read.
+    #[test]
+    fn a_timer_notice_does_not_keep_a_chat_unread() {
+        let archive = Archive::in_memory().expect("opens");
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "Ada").expect("chat");
+        archive
+            .insert_message(&message(chat, "real", 100, false), None)
+            .expect("insert");
+        let notice = timer_notice(chat, "x", 200);
+        archive.insert_message(&notice, None).expect("insert");
+
+        // The id path counts only the real incoming messages after the read.
+        archive.bump_unread(chat).expect("bump");
+        archive.mark_read_to(chat, "real").expect("read");
+        assert_eq!(archive.chat(chat).expect("chat").expect("exists").unread, 0);
+
+        // The timestamp path counts the same way.
+        archive.bump_unread(chat).expect("bump");
+        archive.mark_read_through(chat, 100).expect("read through");
+        assert_eq!(archive.chat(chat).expect("chat").expect("exists").unread, 0);
+    }
+
     /// An archive from before group editing learns who may edit a group's
     /// info: its rows start as unknown, not as open to everyone, and the
     /// metadata's answer and later lock notices are kept.
@@ -3651,6 +4653,32 @@ pub(crate) mod tests {
             .ensure_chat("1@s.whatsapp.net", "Initial history")
             .unwrap();
         assert!(!fresh.take_preferences_refresh().unwrap());
+    }
+
+    #[test]
+    fn link_preview_setting_newest_wins() {
+        let archive = Archive::in_memory().unwrap();
+        assert_eq!(archive.link_previews_disabled().unwrap(), None);
+        assert!(archive.set_link_previews_disabled_at(true, 200).unwrap());
+        assert_eq!(archive.link_previews_disabled().unwrap(), Some(true));
+        // A replayed older change does not undo it; a newer one does.
+        assert!(archive.set_link_previews_disabled_at(false, 100).unwrap());
+        assert_eq!(archive.link_previews_disabled().unwrap(), Some(true));
+        assert!(!archive.set_link_previews_disabled_at(false, 300).unwrap());
+        assert_eq!(archive.link_previews_disabled().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn the_phones_keep_chats_archived_applies_in_timestamp_order() {
+        let archive = Archive::in_memory().unwrap();
+        assert_eq!(archive.unarchive_chats().unwrap(), None);
+        assert!(archive.set_unarchive_chats_at(true, 200).unwrap());
+        assert_eq!(archive.unarchive_chats().unwrap(), Some(true));
+        // A replayed older change does not undo it; a newer one does.
+        assert!(archive.set_unarchive_chats_at(false, 100).unwrap());
+        assert_eq!(archive.unarchive_chats().unwrap(), Some(true));
+        assert!(!archive.set_unarchive_chats_at(false, 300).unwrap());
+        assert_eq!(archive.unarchive_chats().unwrap(), Some(false));
     }
 
     #[test]
@@ -4446,15 +5474,16 @@ pub(crate) mod tests {
         assert_eq!(stored.reactions[0].sender, "3@s.whatsapp.net");
     }
 
+    /// A cumulative receipt advances earlier acknowledged sends, preserving later and incoming rows.
     #[test]
     fn a_read_receipt_covers_everything_before_it() {
         let archive = Archive::in_memory().expect("opens");
         let chat = "1@s.whatsapp.net";
         archive.ensure_chat(chat, "A").expect("chat");
         for (id, timestamp) in [("m1", 100), ("m2", 200), ("m3", 300)] {
-            archive
-                .insert_message(&message(chat, id, timestamp, true), None)
-                .expect("insert");
+            let mut sent = message(chat, id, timestamp, true);
+            sent.status = Delivery::Sent;
+            archive.insert_message(&sent, None).expect("insert");
         }
         archive
             .insert_message(&message(chat, "theirs", 250, false), None)
@@ -4471,10 +5500,58 @@ pub(crate) mod tests {
                 Delivery::Read,
                 Delivery::Read,
                 Delivery::None,
-                Delivery::Pending
+                Delivery::Sent
             ]
         );
         assert_eq!(messages[0].read_at, Some(400));
+    }
+
+    /// A receipt for a later send is no proof that a still-pending send went out.
+    #[test]
+    fn later_receipts_leave_unacknowledged_sends_and_other_chats_alone() {
+        for receipt in [Delivery::Delivered, Delivery::Read, Delivery::Played] {
+            let archive = Archive::in_memory().unwrap();
+            let chat = "1@s.whatsapp.net";
+            let other = "2@s.whatsapp.net";
+            archive.ensure_chat(chat, "Fixture").unwrap();
+            archive.ensure_chat(other, "Other fixture").unwrap();
+            for (id, status) in [
+                ("pending", Delivery::Pending),
+                ("failed", Delivery::Failed),
+                ("sent", Delivery::Sent),
+            ] {
+                let mut row = message(chat, id, 100, true);
+                row.status = status;
+                archive.insert_message(&row, None).unwrap();
+            }
+            let mut other_row = message(other, "other", 100, true);
+            other_row.status = Delivery::Sent;
+            archive.insert_message(&other_row, None).unwrap();
+            assert_eq!(
+                archive.advance_statuses(chat, 200, receipt, 300).unwrap(),
+                ["sent"]
+            );
+            for (id, expected) in [("pending", Delivery::Pending), ("failed", Delivery::Failed)] {
+                let row = archive.message(chat, id).unwrap().unwrap();
+                assert_eq!(row.status, expected);
+                assert_eq!(row.delivered_at, None);
+                assert_eq!(row.read_at, None);
+            }
+            assert_eq!(
+                archive.message(chat, "sent").unwrap().unwrap().status,
+                receipt
+            );
+            assert_eq!(
+                archive.message(other, "other").unwrap().unwrap().status,
+                Delivery::Sent
+            );
+            assert!(
+                archive
+                    .advance_statuses(chat, 200, Delivery::Delivered, 400)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -4551,6 +5628,39 @@ pub(crate) mod tests {
         archive.set_unread(chat, 4).unwrap();
         archive.mark_read_to(chat, "second").unwrap();
         assert_eq!(archive.chat(chat).unwrap().unwrap().unread, 2);
+    }
+
+    #[test]
+    fn a_sent_message_restamped_with_the_server_time_sorts_before_a_later_reply() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "fixture@s.whatsapp.net";
+        archive.ensure_chat(chat, "Fixture").unwrap();
+        // Our clock was ahead: the message was stamped 200, the reply came at 150.
+        archive
+            .insert_message(&message(chat, "mine", 200, true), None)
+            .unwrap();
+        archive
+            .insert_message(&message(chat, "reply", 150, false), None)
+            .unwrap();
+        let ids = |rows: Vec<Message>| rows.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(archive.messages(chat, None, 10).unwrap()),
+            ["reply", "mine"]
+        );
+        assert!(archive.restamp_sent(chat, "mine", 140).unwrap());
+        assert!(!archive.restamp_sent(chat, "mine", 140).unwrap());
+        // The chat's activity came from our message and now follows the reply.
+        assert_eq!(archive.chat(chat).unwrap().unwrap().last_activity, 150);
+        // Only our own messages are restamped.
+        assert!(!archive.restamp_sent(chat, "reply", 100).unwrap());
+        assert_eq!(
+            archive.message(chat, "reply").unwrap().unwrap().timestamp,
+            150
+        );
+        assert_eq!(
+            ids(archive.messages(chat, None, 10).unwrap()),
+            ["mine", "reply"]
+        );
     }
 
     #[test]
@@ -4912,6 +6022,42 @@ pub(crate) mod tests {
         assert_eq!(archive.chat(chat).expect("chat").expect("exists").unread, 0);
     }
 
+    /// The local rows ZapFast invents (call entries, disappearing-timer
+    /// notices) have no counterpart on the phone: a receipt for their id would
+    /// name a message the phone never sent, and a history anchor for one would
+    /// ask for something it does not hold.
+    #[test]
+    fn synthetic_rows_stay_out_of_receipts_and_history_anchors() {
+        let archive = Archive::in_memory().expect("opens");
+        let chat = "1@s.whatsapp.net";
+        archive.ensure_chat(chat, "A").expect("chat");
+        let call = format!("{}1", crate::model::CALL_ENTRY_PREFIX);
+        let notice = format!("{}1", crate::model::TIMER_NOTICE_PREFIX);
+        for (id, at) in [(call.as_str(), 40), (notice.as_str(), 50)] {
+            archive
+                .insert_message(&message(chat, id, at, false), None)
+                .expect("insert");
+        }
+        archive
+            .insert_message(&message(chat, "m1", 100, false), None)
+            .expect("insert");
+        archive
+            .insert_message(&message(chat, "m2", 200, false), None)
+            .expect("insert");
+        assert_eq!(
+            archive.oldest(chat).expect("oldest").expect("row").id,
+            "m1",
+            "the phone-history anchor is a real message"
+        );
+        let ids: Vec<String> = archive
+            .unread_incoming(chat, 10)
+            .expect("ids")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["m2", "m1"], "receipts name only real messages");
+    }
+
     #[test]
     fn marked_unread_stays_a_dot_until_read_or_a_real_count() {
         let archive = Archive::in_memory().expect("opens");
@@ -4998,6 +6144,61 @@ pub(crate) mod tests {
             assert!(archive.read_through(chat).unwrap().is_none());
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A statement that succeeds without changing a row cannot confirm either media path.
+    #[test]
+    fn media_path_updates_must_actually_write_the_row() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "fixture@s.whatsapp.net";
+        archive.ensure_chat(chat, "Fixture").unwrap();
+        let mut picture = message(chat, "picture", 100, false);
+        picture.content = Content::Image {
+            caption: None,
+            motion: Some(crate::model::Motion::default()),
+            media: crate::model::Media {
+                mime: "image/jpeg".into(),
+                size: 7,
+                width: None,
+                height: None,
+                album: None,
+                path: None,
+                state: Default::default(),
+            },
+        };
+        archive.insert_message(&picture, None).unwrap();
+        archive.connection.execute_batch("CREATE TRIGGER ignore_media_paths BEFORE UPDATE OF content ON messages BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        let path = Path::new("synthetic/download.jpg");
+        assert!(
+            archive
+                .put_media_path_at(chat, "picture", None, Some(path))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !archive
+                .put_motion_path(chat, "picture", Some(path))
+                .unwrap()
+        );
+        assert_eq!(
+            archive.message(chat, "picture").unwrap().unwrap().content,
+            picture.content
+        );
+        archive
+            .connection
+            .execute_batch("DROP TRIGGER ignore_media_paths")
+            .unwrap();
+        assert!(
+            archive
+                .put_media_path_at(chat, "picture", None, Some(path))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            archive
+                .put_motion_path(chat, "picture", Some(path))
+                .unwrap()
+        );
     }
 
     /// Checks that persisting a downloaded path updates the attachment content stored in the archive.
@@ -5090,6 +6291,174 @@ pub(crate) mod tests {
             .expect("insert");
         assert_eq!(archive.raw(chat, "m1").expect("raw"), Some(vec![1, 2, 3]));
     }
+
+    #[test]
+    fn a_privacy_id_merge_keeps_a_download_and_a_deletion_from_either_copy() {
+        let archive = Archive::in_memory().unwrap();
+        let (phone, lid) = ("1@s.whatsapp.net", "9@lid");
+        let photo = || Content::Image {
+            motion: None,
+            caption: None,
+            media: crate::model::Media {
+                mime: "image/jpeg".into(),
+                size: 10,
+                width: None,
+                height: None,
+                album: None,
+                path: None,
+                state: Default::default(),
+            },
+        };
+        archive.ensure_chat(phone, "Fixture").unwrap();
+        archive.ensure_chat(lid, "Fixture").unwrap();
+        for chat in [phone, lid] {
+            for (id, content) in [("photo", photo()), ("gone", Content::text("Hello fixture"))] {
+                let row = Message {
+                    content,
+                    ..message(chat, id, 100, false)
+                };
+                archive.insert_message(&row, None).unwrap();
+            }
+        }
+        archive
+            .set_media_path(lid, "photo", Path::new("C:/fixture/lid.jpg"))
+            .unwrap();
+        archive
+            .set_content(lid, "gone", &Content::Revoked, false)
+            .unwrap();
+
+        archive.put_lid("9", "1").unwrap();
+
+        let photo = archive.message(phone, "photo").unwrap().unwrap();
+        assert_eq!(
+            photo
+                .content
+                .media()
+                .and_then(|media| media.path.as_deref()),
+            Some(Path::new("C:/fixture/lid.jpg"))
+        );
+        assert_eq!(
+            archive.message(phone, "gone").unwrap().unwrap().content,
+            Content::Revoked
+        );
+    }
+    /// A privacy-id chat and its phone-number chat, each holding message
+    /// `m` from that person, with `edit` applied to each copy.
+    fn both_copies(edit: impl Fn(&mut Message, &str)) -> Archive {
+        let archive = Archive::in_memory().unwrap();
+        for chat in ["1@s.whatsapp.net", "9@lid"] {
+            archive.ensure_chat(chat, "Fixture").unwrap();
+            let mut row = message(chat, "m", 100, false);
+            edit(&mut row, chat);
+            archive.insert_message(&row, None).unwrap();
+        }
+        archive
+    }
+
+    fn reacted(sender: &str, emoji: &str) -> crate::model::Reaction {
+        crate::model::Reaction {
+            sender: sender.into(),
+            from_me: false,
+            emoji: emoji.into(),
+        }
+    }
+
+    #[test]
+    fn a_privacy_id_merge_keeps_one_reaction_per_person() {
+        let archive = both_copies(|row, chat| {
+            row.reactions = vec![reacted(chat, if chat == "9@lid" { "B" } else { "A" })];
+        });
+        archive.put_lid("9", "1").unwrap();
+        assert_eq!(
+            archive
+                .message("1@s.whatsapp.net", "m")
+                .unwrap()
+                .unwrap()
+                .reactions,
+            [reacted("1@s.whatsapp.net", "A")]
+        );
+    }
+
+    /// The phone-number copy saw a reaction removed that the privacy-id
+    /// copy still holds; the merge keeps the copy it keeps.
+    #[test]
+    fn a_privacy_id_merge_does_not_bring_back_a_removed_reaction() {
+        let archive = both_copies(|row, chat| {
+            row.reactions = vec![reacted("5@s.whatsapp.net", "A")];
+            if chat == "9@lid" {
+                row.reactions.push(reacted("6@s.whatsapp.net", "X"));
+            }
+        });
+        archive.put_lid("9", "1").unwrap();
+        assert_eq!(
+            archive
+                .message("1@s.whatsapp.net", "m")
+                .unwrap()
+                .unwrap()
+                .reactions,
+            [reacted("5@s.whatsapp.net", "A")]
+        );
+    }
+
+    /// A view-once message is final on a linked device: an older copy filed
+    /// as a plain attachment does not replace it.
+    #[test]
+    fn a_privacy_id_merge_keeps_a_view_once_placeholder() {
+        let once = Content::PhoneOnly {
+            view_once: true,
+            live_location: false,
+            once: None,
+        };
+        let archive = both_copies(|row, chat| {
+            row.content = if chat == "9@lid" {
+                Content::Image {
+                    motion: None,
+                    caption: None,
+                    media: crate::model::Media {
+                        mime: "image/jpeg".into(),
+                        size: 10,
+                        width: None,
+                        height: None,
+                        album: None,
+                        path: None,
+                        state: Default::default(),
+                    },
+                }
+            } else {
+                once.clone()
+            };
+        });
+        archive.put_lid("9", "1").unwrap();
+        assert_eq!(
+            archive
+                .message("1@s.whatsapp.net", "m")
+                .unwrap()
+                .unwrap()
+                .content,
+            once
+        );
+    }
+
+    /// A merge reads only the copies it has something to settle on, and
+    /// never their raw messages.
+    #[test]
+    fn a_merge_reads_only_the_copies_that_differ() {
+        let archive = both_copies(|row, _| row.id = "same".into());
+        for chat in ["1@s.whatsapp.net", "9@lid"] {
+            let row = Message {
+                content: Content::text(format!("copy in {chat}")),
+                ..message(chat, "different", 100, false)
+            };
+            archive.insert_message(&row, Some(b"raw")).unwrap();
+        }
+        let copies = archive
+            .duplicate_copies("9@lid", "1@s.whatsapp.net")
+            .unwrap();
+        assert_eq!(
+            copies.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["different"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5128,6 +6497,7 @@ mod sticker_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            transcript: None,
         }
     }
 
@@ -5308,6 +6678,7 @@ mod media_path_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            transcript: None,
         }
     }
 

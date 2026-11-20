@@ -212,9 +212,7 @@ impl Section {
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    if theme::chrome_in_headers(ui.ctx()) {
-        super::banner(app, ui);
-    }
+    super::banner(app, ui);
     let palette = app.palette;
     let locale = app.locale;
     // The caption buttons ZapFast draws, beside the column's title row when
@@ -441,6 +439,30 @@ fn sections(app: &App) -> Vec<Section> {
         ),
         |settings| &mut settings.auto_download,
     );
+    chats.toggle(
+        translated(locale, "Transcribe voice messages"),
+        translated(
+            locale,
+            "Writes what they say under each one as it comes into view. Audio never leaves this computer.",
+        ),
+        |settings| &mut settings.transcribe_voice_notes,
+    );
+    let model = app.settings.transcription_model;
+    let description = format!(
+        "{}\n{}\n{}",
+        crate::i18n::gettext(locale, model.description()),
+        crate::i18n::gettext(locale, "Download from Hugging Face: {size}")
+            .replace("{size}", &crate::util::bytes(model.total_bytes())),
+        crate::i18n::gettext(
+            locale,
+            "Saved transcripts are preserved. Use Transcribe again on a voice message to replace its text."
+        )
+    );
+    chats.row(
+        translated(locale, "Transcription model"),
+        description,
+        transcription_model,
+    );
     chats.account_toggle(
         translated(locale, "Fetch older history"),
         translated(
@@ -591,6 +613,23 @@ fn sections(app: &App) -> Vec<Section> {
         |settings| &mut settings.send_typing,
     );
     app_lock_rows(app, &mut privacy);
+    privacy.row(
+        translated(locale, "Blocked contacts"),
+        "",
+        move |ui, app| {
+            if theme::pill_button(
+                ui,
+                &app.palette,
+                &crate::i18n::gettext(locale, "Manage"),
+                false,
+            )
+            .clicked()
+            {
+                app.actions
+                    .push(Action::ShowDialog(Dialog::BlockedContacts));
+            }
+        },
+    );
     // The account values live on the phone: they are shown once fetched and
     // edited only while connected with a fresh snapshot.
     let editable = app.is_connected() && app.account_privacy.editable();
@@ -651,11 +690,24 @@ fn sections(app: &App) -> Vec<Section> {
     }
 
     let mut system = Section::new(translated(locale, "System"));
-    system.toggle(
-        translated(locale, "Keep running when the window closes"),
-        keyed(translated(locale, "Quit from the tray or with Ctrl+Q.")),
-        |settings| &mut settings.keep_running_in_background,
-    );
+    // A closed Mac app stays in the Dock, which brings its window back, so
+    // on macOS the same setting decides only the menu-bar item.
+    if cfg!(target_os = "macos") {
+        system.toggle(
+            translated(locale, "Show in the menu bar"),
+            keyed(translated(
+                locale,
+                "Closing the window keeps ZapFast in the Dock. Quit with Ctrl+Q.",
+            )),
+            |settings| &mut settings.keep_running_in_background,
+        );
+    } else {
+        system.toggle(
+            translated(locale, "Keep running when the window closes"),
+            keyed(translated(locale, "Quit from the tray or with Ctrl+Q.")),
+            |settings| &mut settings.keep_running_in_background,
+        );
+    }
     if app.start_with_system.is_some() {
         system.row(
             translated(locale, "Start at login"),
@@ -1119,8 +1171,11 @@ fn theme_picker(ui: &mut egui::Ui, app: &mut App) {
             palette.text,
         );
         response.response.widget_info(|| {
-            let mut info =
-                egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), "Theme");
+            let mut info = egui::WidgetInfo::labeled(
+                egui::WidgetType::ComboBox,
+                ui.is_enabled(),
+                crate::i18n::gettext(app.locale, "Theme"),
+            );
             info.current_text_value = Some(selected.to_owned());
             info
         });
@@ -1128,7 +1183,7 @@ fn theme_picker(ui: &mut egui::Ui, app: &mut App) {
             ui,
             &palette,
             Some(Icon::ExternalLink),
-            "Open themes folder",
+            &crate::i18n::gettext(app.locale, "Open themes folder"),
             false,
         )
         .clicked()
@@ -1205,9 +1260,7 @@ fn language_picker(ui: &mut egui::Ui, app: &mut App) {
 
 /// Wallpaper colour picker and live preview.
 pub fn wallpaper_show(app: &mut App, ui: &mut egui::Ui) {
-    if theme::chrome_in_headers(ui.ctx()) {
-        super::banner(app, ui);
-    }
+    super::banner(app, ui);
     let palette = app.palette;
     let body_height = ui.available_height().max(0.0);
     ui.with_layout(
@@ -1869,6 +1922,89 @@ fn custom_titlebar_switch(ui: &mut egui::Ui, app: &mut App) {
     if response.changed() {
         app.actions.push(Action::SetCustomTitlebar(value));
     }
+}
+
+fn transcription_model(ui: &mut egui::Ui, app: &mut App) {
+    use crate::transcribe::{Model, State};
+    let palette = app.palette;
+    let locale = app.locale;
+    let mut selected = app.settings.transcription_model;
+    ui.vertical(|ui| {
+        egui::ComboBox::from_id_salt("transcription-model")
+            .selected_text(selected.label())
+            .width(245.0)
+            .show_ui(ui, |ui| {
+                for model in Model::ALL {
+                    ui.selectable_value(&mut selected, model, model.label());
+                }
+            });
+        if selected != app.settings.transcription_model {
+            app.actions.push(Action::SetTranscriptionModel(selected));
+        }
+        let state = app
+            .transcription_state
+            .as_ref()
+            .filter(|(model, _)| *model == selected)
+            .map(|(_, state)| state);
+        if let Some(State::Downloading { received, total }) = state {
+            let fraction = (*received as f64 / (*total).max(1) as f64).clamp(0.0, 1.0) as f32;
+            let label = format!(
+                "{} / {}",
+                crate::util::bytes(*received),
+                crate::util::bytes(*total)
+            );
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(245.0)
+                    .text(label),
+            );
+        } else {
+            let source = match state {
+                Some(State::Queued) => "Waiting for the speech worker…",
+                Some(State::Checking) => "Verifying model files…",
+                Some(State::Loading) => "Loading speech model…",
+                Some(State::Ready) => "Ready",
+                Some(State::Paused) => "Paused",
+                Some(State::Failed(_)) => "Could not prepare the speech model. Try again.",
+                _ => "Downloads automatically on first use.",
+            };
+            let response = widgets::rich_text(
+                ui,
+                &crate::i18n::gettext(locale, source),
+                theme::regular(12.0),
+                palette.secondary,
+            );
+            if let Some(State::Failed(message)) = state {
+                response.on_hover_text(message.clone());
+            }
+        }
+        let busy = state.is_some_and(State::busy);
+        let button = if busy {
+            "Pause transcription"
+        } else if matches!(state, Some(State::Failed(_))) {
+            "Try again"
+        } else if matches!(state, Some(State::Paused)) {
+            "Resume"
+        } else {
+            "Prepare model"
+        };
+        if !matches!(state, Some(State::Ready))
+            && theme::soft_button(
+                ui,
+                &palette,
+                None,
+                &crate::i18n::gettext(locale, button),
+                false,
+            )
+            .clicked()
+        {
+            app.actions.push(if busy {
+                Action::CancelTranscriptionDownload
+            } else {
+                Action::PrepareTranscriptionModel
+            });
+        }
+    });
 }
 
 fn toggle(

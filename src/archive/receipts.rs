@@ -17,7 +17,7 @@ impl Archive {
         id: &str,
         recipients: &[String],
     ) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = super::Batch::begin(&self.connection)?;
         transaction.query_row(
             "SELECT 1 FROM messages WHERE chat = ?1 AND id = ?2 AND from_me = 1",
             params![chat, id],
@@ -92,7 +92,7 @@ impl Archive {
         id: &str,
         receipts: &[(String, Delivery, i64)],
     ) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = super::Batch::begin(&self.connection)?;
         for (recipient, status, at) in receipts {
             self.file_receipt(chat, id, recipient, *status, *at)?;
         }
@@ -116,7 +116,7 @@ impl Archive {
     /// Moves a group message's ticks to its least advanced saved recipient.
     /// Returns whether the message's state changed.
     pub fn settle_group(&self, chat: &str, id: &str) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = super::Batch::begin(&self.connection)?;
         let (rank, delivered_at, read_at, played_at): (
             Option<i64>,
             Option<i64>,
@@ -149,7 +149,7 @@ impl Archive {
     /// them: the message row keeps a direct chat's delivery times. Returns the
     /// furthest state reached and when, if the message moved.
     pub fn settle_direct(&self, chat: &str, id: &str) -> Result<Option<(Delivery, i64)>> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = super::Batch::begin(&self.connection)?;
         let (rank, delivered_at, read_at, played_at): (
             Option<i64>,
             Option<i64>,
@@ -240,7 +240,7 @@ impl Archive {
 
     /// A privacy id and a phone number identify one person, not two readers.
     pub(super) fn merge_group_recipient(
-        transaction: &rusqlite::Transaction<'_>,
+        transaction: &super::Batch<'_>,
         lid: &str,
         pn: &str,
     ) -> Result<()> {
@@ -272,6 +272,22 @@ impl Archive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The merge looks receipts up by recipient, and without this index the
+    /// startup reconciliation scanned the whole table once per identity.
+    #[test]
+    fn the_recipient_lookup_uses_its_index() {
+        let archive = Archive::in_memory().unwrap();
+        let plan: String = archive
+            .connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM group_receipts WHERE recipient = ?1",
+                ["9@lid"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("group_receipts_by_recipient"), "{plan}");
+    }
 
     #[test]
     fn group_receipts_survive_reopening_and_use_the_last_readers_time() {

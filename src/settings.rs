@@ -29,9 +29,9 @@ pub(crate) fn unhex(value: &str) -> Option<Vec<u8>> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
-    #[default]
     Dark,
     Light,
+    #[default]
     System,
     /// macOS's greys, light or dark as the system is, with bubbles shaped as
     /// Messages draws them.
@@ -456,6 +456,10 @@ pub struct Settings {
     /// Download attachments when they enter view instead of on click.
     #[serde(alias = "auto_download_images")]
     pub auto_download: bool,
+    /// Transcribe voice messages as they come into view, on this computer.
+    /// The model runs locally and audio never leaves the computer.
+    pub transcribe_voice_notes: bool,
+    pub transcription_model: crate::transcribe::Model,
     /// Show the default doodle wallpaper behind conversations.
     pub show_wallpaper: bool,
     /// Colour selected in the wallpaper picker.
@@ -476,7 +480,9 @@ pub struct Settings {
     pub reaction_emoji: Vec<(String, u32)>,
     /// User GIPHY API key. Empty uses the optional built-in key.
     pub giphy_key: String,
-    /// Keep the app linked in the tray when the window closes.
+    /// Keep the app linked in the tray when the window closes. On macOS,
+    /// where a closed ZapFast always stays in the Dock, whether it has a
+    /// menu-bar item.
     pub keep_running_in_background: bool,
     /// Desktop notifications while away from the chat.
     pub notifications: bool,
@@ -552,7 +558,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
-            theme: ThemeChoice::Dark,
+            theme: ThemeChoice::System,
             messages_theme: false,
             font: FontChoice::System,
             custom_titlebar: false,
@@ -568,6 +574,8 @@ impl Default for Settings {
             send_read_receipts: true,
             send_typing: true,
             auto_download: true,
+            transcribe_voice_notes: true,
+            transcription_model: crate::transcribe::Model::default(),
             show_wallpaper: true,
             wallpaper_color: WallpaperColor::Theme,
             dark_wallpaper_color: WallpaperColor::Theme,
@@ -970,6 +978,59 @@ impl AccountRoster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_defaults_to_v3_and_remembers_the_selected_model() {
+        let previous: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            previous.transcription_model,
+            crate::transcribe::Model::ParakeetV3
+        );
+        assert!(previous.transcribe_voice_notes);
+        for model in crate::transcribe::Model::ALL {
+            let settings = Settings {
+                transcription_model: model,
+                ..Settings::default()
+            };
+            let stored = serde_json::to_string(&settings).unwrap();
+            let restored: Settings = serde_json::from_str(&stored).unwrap();
+            assert_eq!(restored.transcription_model, model);
+        }
+    }
+
+    #[test]
+    fn theme_defaults_to_follow_system_for_new_and_missing_settings() {
+        assert_eq!(ThemeChoice::default(), ThemeChoice::System);
+        assert_eq!(Settings::default().theme, ThemeChoice::System);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-settings.json");
+        assert_eq!(Settings::load(&missing_path).theme, ThemeChoice::System);
+
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(Settings::load(&path).theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn explicitly_saved_themes_survive_load_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        for theme in [
+            ThemeChoice::Dark,
+            ThemeChoice::Light,
+            ThemeChoice::System,
+            ThemeChoice::Messages,
+        ] {
+            let settings = Settings {
+                theme,
+                ..Settings::default()
+            };
+            settings.save(&path).unwrap();
+            assert_eq!(Settings::load(&path).theme, theme);
+        }
+    }
 
     #[test]
     fn earlier_bundled_sound_names_still_load() {

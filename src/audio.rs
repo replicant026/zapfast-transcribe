@@ -225,8 +225,16 @@ impl Player {
         let Some(loaded) = self.loaded.as_ref() else {
             return;
         };
-        let (wanted, _) = Self::buffer_for(loaded, &self.stretches, self.speed);
-        if self.output.is_none() || Arc::ptr_eq(&wanted, &loaded.buffer) {
+        let (wanted, factor) = Self::buffer_for(loaded, &self.stretches, self.speed);
+        if self.output.is_none() {
+            // A paused clip can change speed without reopening the device.
+            if let Some(loaded) = self.loaded.as_mut() {
+                loaded.buffer = wanted;
+                loaded.factor = factor;
+            }
+            return;
+        }
+        if Arc::ptr_eq(&wanted, &loaded.buffer) {
             return;
         }
         let total = clip_length(loaded.samples.len());
@@ -301,18 +309,20 @@ impl Player {
                     return self.restart(0.0);
                 }
                 if self.output.is_none() {
-                    // Paused when its output failed: open the device again.
+                    // Paused clips release their player so the shared device
+                    // can sleep. Reopen it at the remembered position.
                     let fraction = fraction_of(loaded.base, loaded.samples.len());
                     return self.restart(fraction);
                 }
                 if let Some((_, sink)) = &self.output {
-                    if loaded.paused {
-                        sink.play();
-                    } else {
-                        sink.pause();
-                    }
-                    loaded.paused = !loaded.paused;
+                    sink.pause();
+                    loaded.base = (loaded.base + sink.get_pos().mul_f32(loaded.factor))
+                        .min(clip_length(loaded.samples.len()));
+                    loaded.paused = true;
                 }
+                // A paused rodio player still produces silence forever and
+                // keeps the mixer busy, preventing the device from idling.
+                self.output = None;
                 Ok(())
             }
             _ => self.load(message, path, 0.0),
@@ -336,6 +346,38 @@ impl Player {
         self.stretching = None;
         // A clip the reader stopped is not one that played to its end.
         self.finished = None;
+    }
+
+    /// The message of the clip in the player, until it ends.
+    pub fn current(&self) -> Option<&str> {
+        self.loaded
+            .as_ref()
+            .filter(|loaded| !loaded.done)
+            .map(|loaded| loaded.message.as_str())
+    }
+
+    /// Plays or pauses the clip in the player, whichever chat is on screen.
+    pub fn toggle_current(&mut self) -> Result<(), String> {
+        match self.current().map(str::to_owned) {
+            // Holding the clip, `toggle` never reads the path.
+            Some(message) => self.toggle(&message, Path::new("")),
+            None => Ok(()),
+        }
+    }
+
+    /// Holds a paused clip of `message`, without a sound device.
+    #[cfg(any(test, feature = "demo"))]
+    pub fn hold_paused(&mut self, message: &str) {
+        let samples = Arc::new(vec![0.0; 48_000 * 4]);
+        self.loaded = Some(Loaded {
+            message: message.to_owned(),
+            buffer: samples.clone(),
+            samples,
+            factor: 1.0,
+            base: Duration::from_secs(1),
+            paused: true,
+            done: false,
+        });
     }
 
     /// Takes the message whose clip just played to its end, once. The app uses
@@ -579,7 +621,9 @@ fn decode_file(path: &Path) -> Result<Vec<f32>, String> {
     }
     let file =
         std::fs::File::open(path).map_err(|error| format!("Could not read the audio: {error}"))?;
-    let decoder = rodio::Decoder::new(std::io::BufReader::new(file))
+    // From a file, so the decoder knows its length and may seek: an M4A whose
+    // index (moov) follows its audio, as many recorders write it, needs both.
+    let decoder = rodio::Decoder::try_from(file)
         .map_err(|error| format!("Could not decode the audio: {error}"))?;
     let channels = decoder.channels().get();
     let rate = decoder.sample_rate().get();
@@ -1545,5 +1589,26 @@ mod tests {
             heard.len()
         );
         assert!(levels.len() >= 15, "{}", levels.len());
+    }
+
+    /// An M4A whose index (moov) follows its audio, as many recorders and
+    /// ffmpeg write one, decodes: the decoder seeks to the index.
+    #[test]
+    fn an_m4a_with_its_index_after_the_audio_decodes() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/index-at-end.m4a"
+        ));
+        let bytes = std::fs::read(path).expect("fixture");
+        let at = |atom: &[u8]| bytes.windows(4).position(|window| window == atom);
+        assert!(
+            at(b"moov") > at(b"mdat"),
+            "the fixture keeps its index last"
+        );
+        let samples = decode_file(path).expect("decodes");
+        // Half a second of a 440 Hz tone, give or take the encoder's padding.
+        let seconds = samples.len() as f64 / f64::from(voice::RATE);
+        assert!((0.4..0.7).contains(&seconds), "{seconds}");
+        assert!(samples.iter().any(|sample| sample.abs() > 0.05));
     }
 }

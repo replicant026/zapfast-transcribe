@@ -47,30 +47,18 @@ jobs:
       AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
       AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
       AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
-    # Linux builds run in Debian 12: the binary needs the glibc it was built
-    # against or newer (2.36), and bookworm's libpipewire (0.3.65) meets the
-    # PipeWire output's 0.3.53, which Ubuntu 22.04's does not. The packages
-    # install on Debian 12, Ubuntu 22.10, Fedora 37 and newer. Windows rows
-    # leave it empty and run on the host.
+    # Linux builds run in Ubuntu 24.04 because the bundled ONNX Runtime used
+    # for offline transcription needs newer glibc and libstdc++ symbols than
+    # Debian 12 provides. The packages need glibc 2.39 or newer (Ubuntu 24.04,
+    # Debian 13, Fedora 40 and newer). Windows rows leave it empty and run on
+    # the host.
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            container: debian:12
-          # A native arm64 runner, so the GUI's system libraries need no
-          # cross-compilation sysroot.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            container: debian:12
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          # Cross-compiled from x64: the MSVC arm64 linker ships with the
-          # runner's Visual Studio.
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
+        # v0.21.3 is Windows-only for this fork. Keep the full matrix for
+        # later releases once their ONNX Runtime platform builds are ready.
+        include: ${{ fromJSON(github.ref_name == 'v0.21.3' && '[{"os":"windows-latest","target":"x86_64-pc-windows-msvc"},{"os":"windows-latest","target":"aarch64-pc-windows-msvc"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","container":"ubuntu:24.04"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","container":"ubuntu:24.04"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc"},{"os":"windows-latest","target":"aarch64-pc-windows-msvc"}]') }}
     steps:
       # Before checkout and rustup: the bare image has no curl, git or
       # certificates. Steps run as root, without sudo.
@@ -186,6 +174,7 @@ jobs:
 
   macos:
     name: macOS universal app
+    if: github.ref_name != 'v0.21.3'
     needs: release-source
     permissions:
       contents: read
@@ -262,6 +251,7 @@ jobs:
   # builds from source on its own machines, from the manifest beside it.
   flatpak:
     name: Flatpak bundle
+    if: github.ref_name != 'v0.21.3'
     permissions:
       contents: read
       id-token: write
@@ -300,6 +290,10 @@ jobs:
   publish:
     name: GitHub release
     needs: [build, macos, flatpak]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      (github.ref_name == 'v0.21.3' ||
+      (needs.macos.result == 'success' && needs.flatpak.result == 'success'))
     runs-on: ubuntu-latest
     environment: release-signing
     permissions:
@@ -350,7 +344,7 @@ jobs:
   packaging:
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && github.ref_name != 'v0.21.3'
     needs: publish
     uses: ./.github/workflows/packaging.yml
     with:

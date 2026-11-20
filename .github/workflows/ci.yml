@@ -2,7 +2,7 @@ name: CI
 
 # Pull requests run Linux only: the account's 20 hosted runners are shared
 # by every repository, and a full matrix per push to a pull request kept
-# them all busy for hours (2026-10-26). macOS, Windows, Debian 12 and the
+# them all busy for hours (2026-10-26). macOS, Windows, Ubuntu 24.04 and the
 # other Nix systems run on main, so a platform break shows there before a
 # release tag. Changes to documentation alone skip the build entirely; the
 # required `policy` check lives in policy.yml so it still reports on them.
@@ -118,14 +118,13 @@ jobs:
           name: macos-preview
           path: ${{ runner.temp }}/zapfast-*.png
 
-  # Linux releases build in Debian 12 for its older glibc (release.yml).
-  # Building here too catches a dependency that needs newer system
-  # libraries before a release tag does.
-  debian-12:
-    name: compile (Debian 12)
+  # Linux releases build in Ubuntu 24.04 because the bundled ONNX Runtime
+  # needs newer glibc and libstdc++ symbols for local transcription.
+  ubuntu-24-04:
+    name: compile (Ubuntu 24.04)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    container: debian:12
+    container: ubuntu:24.04
     timeout-minutes: 45
     steps:
       - name: GUI build dependencies
